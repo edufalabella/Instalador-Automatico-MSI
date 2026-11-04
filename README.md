@@ -69,29 +69,32 @@ Ideal para **preparação de computadores**, formatações, suporte técnico e p
 
 ## 📁 Estrutura de pastas
 
+Recomendado (v1.2): todo o sistema dentro de uma pasta cujo nome começa com `#`, e as pastas de MSI na raiz, ao lado dela.
+
 ```
-InstaladorMSI\
+Raiz\                            ← pasta compartilhada / pendrive
 │
-├── INICIAR.bat                  ← ponto de entrada (execute este)
-├── instalador_msi.py            ← programa principal
-├── python-3.12.x-amd64.exe      ← instalador do Python (você adiciona)
-├── README.md
+├── INSTALAR.bat                 ← ÚNICO arquivo para executar
 │
-├── Office\                      ← sua pasta de instaladores
-│   ├── Office_Setup.msi
-│   └── Teams.msi
-├── Drivers\
-│   └── Driver_Video.msi
-├── Utilitarios\
-│   ├── 7zip.msi
-│   └── VLC.msi
+├── #SISTEMA\                    ← interno: ninguém precisa abrir
+│   ├── INICIAR.bat              ← só roda se chamado pelo INSTALAR.bat
+│   ├── VER_STATUS.bat           ← acompanha o progresso
+│   ├── instalador_msi.py
+│   ├── python-3.x.x-amd64.exe   ← instalador do Python
+│   ├── wix3\                    ← candle.exe/light.exe (conversão EXE → MSI)
+│   ├── README.md
+│   └── logs\                    ← criada automaticamente
 │
-└── logs\                        ← criada automaticamente
+├── TECNICO-ELETRICA\            ← pastas de instaladores (cada uma vira uma opção)
+│   └── *.msi / *.exe
+├── TI-APT\
+└── ...
 ```
 
-- O **nome das subpastas** é o que aparece no menu.
-- Só aparecem no menu as pastas que **contêm pelo menos um `.msi`**.
-- As pastas `logs`, `build`, `dist`, `__pycache__` e pastas iniciadas por `.` são ignoradas.
+- Se o programa estiver numa pasta com nome iniciado por `#`, os MSI são procurados na **pasta pai**. Em qualquer outra pasta, ao lado do programa (como antes).
+- Pastas que começam com `#` ou `.` nunca entram no menu; `logs`, `build`, `dist` e `__pycache__` também são ignoradas.
+- Para apontar outra pasta de MSI: `INSTALAR.bat --raiz D:\Instaladores`.
+- O **nome das subpastas** é o que aparece no menu; só aparecem as que **contêm pelo menos um `.msi`**.
 
 ---
 
@@ -100,12 +103,12 @@ InstaladorMSI\
 ### 1. Prepare a pasta
 
 1. Copie a pasta `InstaladorMSI` para o computador (ou para um pendrive/rede).
-2. Baixe o instalador do Python em <https://www.python.org/downloads/windows/> (*Windows installer 64-bit*, versão 3.9+) e coloque-o **na raiz**, ao lado do `INICIAR.bat`. Qualquer nome no formato `python-*.exe` funciona.
+2. Baixe o instalador do Python em <https://www.python.org/downloads/windows/> (*Windows installer 64-bit*, versão 3.9+) e coloque-o dentro da **`#SISTEMA`**, ao lado do `INICIAR.bat`. Qualquer nome no formato `python-*.exe` funciona.
 3. Crie subpastas e coloque os `.msi` dentro delas.
 
 ### 2. Execute
 
-Dê um duplo clique em **`INICIAR.bat`** e aceite a solicitação de administrador.
+Dê um duplo clique em **`INSTALAR.bat`** (na raiz) e aceite a solicitação de administrador.
 
 - Se o Python **já está instalado** → o menu abre direto.
 - Se **não está** → o instalador da raiz é executado em modo silencioso e, ao terminar, o programa continua sozinho (não precisa reabrir nem reiniciar).
@@ -305,6 +308,7 @@ Outra instalação está em curso (frequentemente o Windows Update). Aguarde ter
 
 **Erro `1603`**
 Falha genérica do pacote. Abra o log correspondente em `logs\` para ver o motivo (permissão, dependência ausente, conflito de versão).
+Se o log mostrar `Adding REMOVE property. Its value is 'ALL'` e `InstallInitialize. Return value 3` logo no começo, é o defeito dos MSI gerados pelas versões **≤ 1.4** (Feature sem Component). Na v1.5 isso é corrigido e reparado automaticamente (veja *Reparo automático* abaixo).
 
 **Windows SmartScreen bloqueia o `.bat`**
 Clique em *Mais informações → Executar assim mesmo*, ou desbloqueie o arquivo em *Propriedades → Desbloquear*.
@@ -316,7 +320,7 @@ O programa usa os parâmetros padrão. Para casos específicos, edite a função
 
 ## ⚠️ Limitações conhecidas
 
-- Instala apenas arquivos **`.msi`** (não executa `.exe`, `.msix` ou `.msu`).
+- Instala arquivos **`.msi`**; arquivos `.exe` são convertidos antes para MSI (veja *Conversão EXE → MSI*). `.msix` e `.msu` não são suportados.
 - Não aplica parâmetros personalizados por pacote (veja a dica acima).
 - Não há desinstalação nem reparo de pacotes.
 - Funciona apenas no **Windows**.
@@ -325,3 +329,144 @@ O programa usa os parâmetros padrão. Para casos específicos, edite a função
 ---
 
 <p align="center"><sub>Desenvolvido por <b>Eduardo Falabella</b></sub></p>
+
+---
+
+## 🤖 Modo automático (v1.1)
+
+Instala **sem menu, sem ENTER e sem confirmação**, mostrando o progresso e gravando um status ao vivo.
+
+### Como usar
+
+| Quero... | Faça |
+|---|---|
+| Instalar tudo | Duplo clique em `INSTALAR.bat` |
+| Abrir o menu interativo | `INSTALAR.bat --menu` |
+| Só conferir (simula as conversões, não altera nada) | `INSTALAR.bat --listar` |
+| Instalar só algumas pastas | `INSTALAR.bat --pastas Office,Drivers` (sem aspas; nomes de pasta sem espaços) |
+| Rodar em tarefa agendada / GPO / SCCM | `INSTALAR.bat --sem-pausa` |
+| Acompanhar de outra janela/PC | `INSTALAR.bat --status` (atualiza a cada 3 s) |
+
+> **Importante:** sem `--sem-pausa` o `.bat` espera uma tecla no final (para você ler o resultado). Em execução sem ninguém logado isso travaria — **use sempre `--sem-pausa` em automações**.
+
+Ao abrir sem ser administrador, o `.bat` pede UAC e **abre uma nova janela** — é nela que o progresso aparece.
+
+### Parâmetros do `instalador_msi.py`
+
+| Parâmetro | Função |
+|---|---|
+| `--auto` | Modo automático (sem interação nem animação) |
+| `--pastas A,B` | Instala apenas as pastas indicadas (padrão: todas) |
+| `--listar` | Lista pastas/MSIs encontrados e sai |
+| `--raiz CAMINHO` | Pasta que contém as subpastas de MSI (padrão: pasta pai de `#SISTEMA`) |
+| `--sem-converter` | Não converte `.exe` (só instala os `.msi` existentes) |
+| `--manter-exe` | Converte, mas **não apaga** os `.exe` |
+| `--sem-pausa` | Usado pelo `.bat`: não espera tecla no final |
+| `--sem-cores` | Remove códigos ANSI (automático se a saída for redirecionada) |
+
+### Status ao vivo
+
+Durante a execução o programa mostra, com hora em cada linha:
+
+```
+20:49:02 [1/3] Office › app.msi
+        20:49:17 ... ainda instalando (15s) | etapa: InstallFiles
+        20:49:19 [ OK ] Instalado com sucesso (17s)
+```
+
+e mantém `logs\status.txt` atualizado (estado, progresso, pacote atual, etapa do MSI, concluídos). Veja com `INSTALAR.bat --status` ou abra o arquivo.
+
+### Códigos de saída
+
+| Código | Significado |
+|:---:|---|
+| `0` | Tudo instalado |
+| `3010` | Tudo instalado, **reinício necessário** |
+| `1` | Pelo menos um MSI falhou (veja `logs\`) |
+| `2` | Pasta informada em `--pastas` não existe / sem MSI |
+| `4` | Nenhum MSI encontrado |
+| `6` | Instalou, mas ficou algum `.exe` sem converter (veja `status.txt`) |
+| `5` | Sem administrador (no modo automático o `.py` não usa UAC; o `.bat` sim) |
+
+### Erro 1618
+
+Se o `msiexec` devolver `1618` (outra instalação em andamento, como o Windows Update), o programa espera 30 s e tenta de novo, até 5 vezes (`TENTATIVAS_1618` / `ESPERA_1618` no topo do `.py`).
+
+### Tarefa agendada (sem ninguém logado)
+
+Conta `SYSTEM`, *Executar com privilégios mais altos*, ação:
+
+```
+cmd.exe /c ""C:\Caminho\Raiz\INSTALAR.bat" --sem-pausa > "C:\Caminho\Raiz\#SISTEMA\logs\auto.txt" 2>&1"
+```
+
+---
+
+## 🔄 Conversão EXE → MSI (v1.3)
+
+A cada execução, **antes de instalar**, o programa varre as pastas de instaladores (nunca a `#SISTEMA` nem pastas `#`/`.`), converte cada `.exe` em um `.msi` de mesmo nome na mesma pasta, **verifica** o resultado e então **apaga o `.exe`**. Em seguida instala tudo, inclusive os MSI novos.
+
+### O que é a "conversão"
+
+Não existe conversão real de EXE para MSI. O programa cria um MSI que **contém o .exe** e o executa em modo silencioso na instalação (WiX 3: `candle` + `light`, na pasta `wix3`, sem precisar de .NET SDK nem de internet). O MSI **não conhece os arquivos** que o .exe instala, então não desinstala o programa.
+
+### Como ele descobre os argumentos silenciosos
+
+1. Se existir `nome.exe.args` ao lado do .exe, usa a **1ª linha** desse arquivo (ex.: `/silent /noreboot`). Escrever `IGNORAR` faz o programa pular esse .exe.
+2. Senão, detecta o tipo pelo conteúdo do arquivo:
+
+| Tipo detectado | Argumentos usados |
+|---|---|
+| Inno Setup | `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-` |
+| NSIS | `/S` |
+| WiX Burn (vários redistribuíveis Microsoft) | `/quiet /norestart` |
+| Advanced Installer | `/exenoui /qn /norestart` |
+| InstallShield | `/s /v"/qn REBOOT=ReallySuppress"` |
+
+3. Tipo desconhecido: **não converte e não apaga** — avisa e conta como pendência (código de saída 6).
+
+### Quando o .exe é apagado
+
+Somente se o MSI foi gerado **e** passou na verificação (arquivo MSI válido, tamanho coerente, tabela `Binary` contendo o .exe **e ao menos um `Component` ligado à Feature**, tudo conferido pelo Windows Installer). Qualquer falha mantém o .exe e remove o MSI incompleto. Use `--manter-exe` para nunca apagar.
+
+### O que é pulado (e o .exe fica intacto)
+
+- Desinstaladores (`unins*.exe`, `uninstall*.exe`);
+- .exe cujo tipo é desconhecido e sem `.args`;
+- Pasta com arquivos `.cab` (parece bootstrapper de um MSI já existente — converter duplicaria a instalação);
+- Já existe um `.msi` com o mesmo nome do `.exe`.
+
+### Cuidados
+
+- **Teste antes:** `INSTALAR.bat --listar` mostra o que seria convertido, com tipo e argumentos, sem alterar nada. Teste um instalador de cada tipo antes de rodar em tudo — se os argumentos estiverem errados, o MSI é gerado, o `.exe` é apagado e a instalação silenciosa falha ou trava.
+- **Mantenha uma cópia dos .exe originais** fora desta pasta.
+- Códigos de retorno do .exe diferentes de 0 (inclusive 3010) fazem o MSI falhar com erro 1603.
+- Arquivos muito grandes (acima de ~2 GB) não cabem em um MSI.
+- Se o Windows bloquear os arquivos de `wix3` (extraídos de um zip baixado), rode no PowerShell: `Get-ChildItem "#SISTEMA\wix3" | Unblock-File`.
+- Cada MSI criado aparece como um programa extra em *Aplicativos instalados*, com o nome do .exe.
+- Logs de cada conversão: `logs\conv_<nome>_<data>.log`; o andamento aparece em `status.txt` na seção *Conversões EXE → MSI*.
+
+---
+
+## 🩹 Correção do erro 1603 e reparo automático (v1.5)
+
+**Causa:** até a v1.4 o `.wxs` gerado tinha uma `<Feature>` sem nenhum `<Component>`. O Windows Installer trata esse pacote como vazio, injeta `REMOVE=ALL` e aborta em `InstallInitialize` (erro 1603). O aviso `LGHT1079 ... media1.cab does not contain any files` no log de conversão já apontava isso. Além disso, a verificação só olhava a tabela `Binary`, então aprovava o MSI defeituoso e **apagava o .exe**.
+
+**O que mudou:**
+- o MSI agora inclui um `Component` (apenas uma chave de registro em `HKLM\SOFTWARE\InstaladorAutomaticoMSI\<UpgradeCode>`) ligado à Feature `Main`;
+- `verificar_msi` passou a exigir `Component` + `FeatureComponents`; sem isso o .exe **não** é apagado.
+
+**Reparo automático:** ao iniciar, o programa procura MSIs gerados por ele mesmo (Fabricante `Instalador Automatico`, com `Binary\SetupExe`) que não tenham `Component`. Para cada um: extrai o .exe de dentro do MSI, reconstrói o pacote, verifica e só então substitui o MSI antigo (se algo falhar, o antigo é mantido). Logs: `logs\reparo_<nome>_<data>.log`. Use `--sem-converter` para pular. Os argumentos silenciosos vêm de, em ordem: `<nome>.exe.args` ao lado do MSI → os já gravados no MSI → detecção automática.
+
+**Desinstalação:** desinstalar o MSI gerado remove só a chave de registro marcadora, **não** o programa instalado pelo .exe; desinstale pelo próprio programa.
+
+---
+
+## 🔒 Um único arquivo para executar (v1.4)
+
+Na raiz fica só o **`INSTALAR.bat`**; tudo o mais está em `#SISTEMA`.
+
+- O `INICIAR.bat` **recusa execução direta** (mostra um aviso e sai); ele só roda quando chamado pelo `INSTALAR.bat`.
+- `INSTALAR.bat` sem parâmetros = modo automático. Outros modos: `--menu`, `--listar`, `--status`, `--pastas`, `--sem-pausa`, `--manter-exe`.
+- Para esconder a pasta de quem navega pela raiz (opcional): `attrib +h +s "#SISTEMA"` (para desfazer: `attrib -h -s "#SISTEMA"`). É só visual: quem digitar o caminho ainda acessa.
+- Para impedir de verdade, use permissões NTFS/compartilhamento: usuários comuns só com **leitura e execução** na raiz, e **modificação** apenas para a equipe de TI.
