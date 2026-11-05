@@ -197,8 +197,11 @@ class Tela:
         self._montar_rodape()          # empacota antes de 'corpo' expandir? (side=bottom)
         self._montar_selecao()
         self._montar_progresso()
-        self.mostrar_selecao()
         self.root.protocol("WM_DELETE_WINDOW", self._fechar)
+        if cfg.get("preparar"):
+            self.root.after(150, self._preparar)      # converte/repara .exe -> .msi DENTRO desta tela
+        else:
+            self.mostrar_selecao()
         self.root.bind("<Control-a>", lambda e: self.marcar_todos(True))
 
     # ------------------------------------------------------------ infraestrutura
@@ -594,8 +597,9 @@ class Tela:
 
     def _fechar(self):
         if self.rodando and not messagebox.askyesno(
-                "Instalação em andamento",
-                "Há uma instalação em andamento.\nSair agora pode deixá-la incompleta.\n\nDeseja sair mesmo assim?"):
+                "Operação em andamento",
+                "Há uma operação em andamento (conversão ou instalação).\n"
+                "Sair agora pode deixá-la incompleta.\n\nDeseja sair mesmo assim?"):
             return
         self.cancelar.set()
         self.root.destroy()
@@ -603,6 +607,52 @@ class Tela:
     def _cancelar(self):
         self.cancelar.set()
         self.b_cancelar.configurar("Cancelando após o item atual…", False)
+
+    # ------------------------------------------------------------ preparação (EXE -> MSI)
+    def _preparar(self):
+        self.resultados = []
+        self.rodando = True
+        self.fila = queue.Queue()
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
+        self.p_titulo.configure(text="Preparando os pacotes…", fg=C["texto"])
+        self.p_atual.configure(text="Verificando e convertendo instaladores .exe em .msi")
+        self.p_detalhe.configure(text="Só leva tempo quando há .exe novos nas pastas.")
+        for w in (self.p_oks, self.p_falhas, self.p_cont):
+            w.configure(text="")
+        self.barra.set(0, C["acento"])
+        for b in (self.b_logs, self.b_cancelar, self.b_fechar, self.b_voltar, self.b_refazer):
+            b.pack_forget()
+        self.b_logs.pack(side="left")
+        self.v_sel.pack_forget()
+        self.v_prog.pack(fill="both", expand=True)
+        self._subtitulo("Preparando — aguarde, a seleção abre em seguida")
+        cb = lambda ev, **kw: self.fila.put((ev, kw))   # noqa: E731
+
+        def trabalho():
+            try:
+                self.cfg["preparar"](cb)
+            except Exception as exc:  # noqa: BLE001
+                self.fila.put(("erro", {"msg": f"preparação: {exc}"}))
+            self.fila.put(("preparado", {}))
+
+        threading.Thread(target=trabalho, daemon=True).start()
+        self.root.after(120, self._bombear)
+
+    def _ev_aviso(self, msg, nivel="info", **_):
+        tag = {"ok": "ok", "erro": "erro", "aviso": "aviso"}.get(nivel, "info")
+        self._log([(f"{self._hora()}  ", "hora"), (str(msg), tag)])
+
+    def _ev_prep_item(self, i, total, nome, **_):
+        self.p_atual.configure(text=nome)
+        self.p_detalhe.configure(text=f"Convertendo .exe em .msi   ·   {i} de {total}")
+        self.barra.set((i - 1) / max(total, 1), C["acento"])
+        self.p_cont.configure(text=f"{i} de {total}")
+
+    def _ev_preparado(self, **_):
+        self.rodando = False
+        self.mostrar_selecao()
 
     # ------------------------------------------------------------ instalação
     def instalar_selecionados(self):

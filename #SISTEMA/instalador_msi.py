@@ -17,6 +17,7 @@ Desenvolvido por Eduardo Falabella
 import argparse
 import contextlib
 import ctypes
+import hashlib
 import mmap
 import os
 import re
@@ -25,17 +26,20 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from xml.sax.saxutils import quoteattr
 
+import exec_silencioso as ex   # execução oculta, árvore de processos, watchdog (mesma pasta)
+
 # ----------------------------------------------------------------------------
 # Configurações
 # ----------------------------------------------------------------------------
 TITULO = "INSTALADOR AUTOMÁTICO MSI"
-VERSAO = "2.0"
+VERSAO = "2.1"
 DESENVOLVEDOR = "Eduardo Falabella"
 PASTAS_IGNORADAS = {"logs", "__pycache__", "build", "dist"}
 BUSCA_RECURSIVA = True          # procura .msi também dentro de subpastas
@@ -50,6 +54,17 @@ FABRICANTE_WRAPPER = "Instalador Automatico"   # marca dos MSI gerados por este 
 TENTATIVAS_1618 = 5             # re-tentativas quando há outra instalação em andamento
 ESPERA_1618 = 30                # segundos entre as tentativas
 
+# --- blindagem contra telas (v2.1) ---
+OCULTAR_JANELAS = True          # qualquer janela criada por um instalador é ocultada na hora
+VIGIAR_UI = True                # janela + instalador parado (esperando clique) => encerra e tenta o próximo argumento
+UI_OCIOSO_S = 60                # segundos de "tela aberta e sem atividade" para considerar travado
+MAX_TENTATIVAS_ARGS = 5         # quantos conjuntos de argumentos silenciosos tentar por instalador
+POS_OCIOSO_S = 45               # após o processo principal sair: espera filhos até ficarem ociosos
+POS_MAX_S = 600                 # teto de espera pelos processos filhos
+ESPERA_MSI_LIVRE_S = 900        # espera máxima pelo Windows Installer ficar livre entre pacotes
+VERIFICAR_HASH_ATE_MB = 300     # na conversão, confere SHA-256 do .exe dentro do MSI até este tamanho
+LIMITE_BINARY_BYTES = 2_000_000_000   # limite prático de um stream na tabela Binary do MSI
+
 CONVERTER_EXE = True            # procura .exe nas pastas e converte para .msi antes de instalar
 EXCLUIR_EXE_APOS_CONVERTER = True   # apaga o .exe SÓ depois que o MSI foi gerado e verificado
 EXE_IGNORAR_PREFIXOS = ("unins", "uninst", "uninstall")   # nunca converte desinstaladores
@@ -62,6 +77,8 @@ CODIGOS_OK = {
     3010: "Instalado (reinicialização necessária)",
     0x80070BC2: "Instalado (reinicialização necessária)",   # HRESULT que o Burn pode devolver
     1638: "Já existe outra versão instalada",
+    0x80070666: "Já existe outra versão instalada",    # HRESULT do 1638 (Burn)
+    1707: "Instalado com sucesso",
 }
 
 # ----------------------------------------------------------------------------
@@ -197,8 +214,11 @@ def saida_linear() -> bool:
     return AUTO or GUI_ATIVA
 
 
+SEM_CONSOLE = False                     # True quando rodando com pythonw (sem janela de console)
+
+
 def limpar_tela() -> None:
-    if saida_linear():
+    if saida_linear() or SEM_CONSOLE:
         return
     os.system("cls" if os.name == "nt" else "clear")
 
@@ -349,10 +369,25 @@ def ultima_etapa_msi(log_file: Path) -> str:
 
 
 _CB_BATIMENTO = None   # callable(seg, etapa) - usado pela tela gráfica para mostrar sinal de vida
+_CB_EVENTO = None      # callable(evento, **dados) - tela gráfica (instalação e preparação)
+
+
+def evento(nome: str, **dados) -> None:
+    """Envia um evento para a tela gráfica (se houver). Nunca levanta exceção."""
+    if _CB_EVENTO:
+        with contextlib.suppress(Exception):
+            _CB_EVENTO(nome, **dados)
+
+
+def aviso(msg: str, nivel: str = "info") -> None:
+    """Mensagem para o console (modo texto/auto) e para o log da tela gráfica."""
+    cor = {"ok": VERDE, "erro": VERMELHO, "aviso": AMARELO}.get(nivel, CINZA)
+    print(f"        {ts()}{cor}{msg}{RESET}", flush=True)
+    evento("aviso", msg=msg, nivel=nivel)
 
 
 def _matar_arvore(pid: int) -> None:
-    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+    ex.rodar_oculto(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
 
 
 def aguardar_com_status(proc: "subprocess.Popen", log_file: Optional[Path] = None,
@@ -393,10 +428,11 @@ _DICAS = {
     112: "sem espaço em disco",
     1223: "cancelado",
     1460: "tempo limite excedido (instalador travado?)",
-    1602: "cancelado/interrompido (o instalador pediu interação ou foi bloqueado)",
+    1602: "o instalador abriu uma tela e esperou interação (encerrado pelo vigia) ou foi cancelado",
     1603: "erro fatal no pacote MSI",
     1618: "outra instalação MSI em andamento (ou instalador aninhado dentro do msiexec)",
     1620: "não foi possível abrir/extrair o pacote",
+    1639: "argumento de linha de comando inválido",
     1625: "bloqueado por política do sistema",
     0xC0000005: "violação de acesso (crash do instalador)",
     0xC0000409: "falha interna do instalador (crash; comum ao rodar como SYSTEM/sessão 0)",
@@ -434,16 +470,36 @@ def tipo_por_args(args: str) -> str:
         return "Burn"
     if a.startswith("/s") and "/v" in a:
         return "InstallShield"
+    if "--accept-licenses" in a:
+        return "Qt Installer Framework"
     if a in ("/s", "/silent", "/s /norestart"):
         return "NSIS"
     return ""
 
 
-def _executar_msiexec(msi: Path, log_file: Path) -> int:
-    modo = "/qn" if MODO_SILENCIOSO else "/qb"
-    cmd = ["msiexec", "/i", str(msi), modo, "/norestart", "/L*v", str(log_file)]
+def _ler_linhas_args(arq: Path) -> list:
+    """Linhas úteis de um arquivo .args (ignora vazias e comentários iniciados por # ou ;)."""
     try:
-        proc = subprocess.Popen(cmd)
+        linhas = arq.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    except OSError:
+        return []
+    return [l.strip() for l in linhas if l.strip() and not l.strip().startswith(("#", ";"))]
+
+
+def _executar_msiexec(msi: Path, log_file: Path) -> int:
+    """msiexec 100% silencioso. Extras opcionais ao lado do MSI:
+       <nome>.mst        -> transform (TRANSFORMS=...)
+       <nome>.msi.args   -> 1ª linha = propriedades extras (ex.: ACCEPTEULA=1 LICENSEKEY=XXXX)."""
+    modo = "/qn" if MODO_SILENCIOSO else "/qb"
+    cmd = f'msiexec /i "{msi}" {modo} /norestart /L*v "{log_file}" REBOOT=ReallySuppress'
+    mst = msi.with_suffix(".mst")
+    if mst.is_file():
+        cmd += f' TRANSFORMS="{mst}"'
+    extra = _ler_linhas_args(msi.with_name(msi.name + ".args"))
+    if extra:
+        cmd += " " + extra[0]
+    try:
+        proc = subprocess.Popen(cmd, env=ex.ambiente_silencioso(), **ex.kwargs_ocultos())
     except FileNotFoundError:
         print(f"  {VERMELHO}[ERRO] msiexec não encontrado (somente Windows).{RESET}")
         return -1
@@ -468,6 +524,7 @@ def _com_retentativa(executar) -> int:
 
 def instalar_msi(msi: Path, log_file: Path) -> int:
     """Instala via msiexec (MSI de verdade). Re-tenta se houver outra instalação em curso (1618)."""
+    ex.aguardar_msi_livre(ESPERA_MSI_LIVRE_S)
     return _com_retentativa(lambda: _executar_msiexec(msi, log_file))
 
 
@@ -496,27 +553,68 @@ def classificar_pacote(msi: Path) -> tuple:
     return ("EXE→MSI" if pacote_embutido(msi) else "MSI"), tam
 
 
-def _args_embutidos(msi: Path, exe: Path) -> str:
-    """Argumentos silenciosos: 1) '<nome>.exe.args' ao lado do MSI; 2) os gravados no MSI; 3) detecção."""
-    sidecar = msi.with_name(msi.stem + ".exe.args")
-    if sidecar.is_file():
-        linhas = sidecar.read_text(encoding="utf-8-sig", errors="replace").strip().splitlines()
-        txt = linhas[0].strip() if linhas else ""
-        if txt and txt.upper() != "IGNORAR":
-            return txt
+# Argumentos silenciosos por tipo de instalador. A PRIMEIRA linha é a preferida; as seguintes só são
+# tentadas se a anterior fizer o instalador abrir uma tela e travar (vigia) ou rejeitar o argumento.
+ESCADAS = {
+    "Inno Setup": ["/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-",
+                   "/SILENT /SUPPRESSMSGBOXES /NORESTART /SP-"],
+    "NSIS": ["/S"],
+    "Burn": ["/quiet /norestart", "/passive /norestart"],
+    "Advanced Installer": ["/exenoui /qn /norestart", "/exenoui /qb /norestart", "/qn /norestart"],
+    "InstallShield": ['/s /v"/qn REBOOT=ReallySuppress"', '/s /sms /v"/qn REBOOT=ReallySuppress"',
+                      '/s /v"/qb REBOOT=ReallySuppress"'],
+    "Qt Installer Framework": ["--accept-licenses --default-answer --confirm-command install"],
+}
+# Tipo desconhecido (ou ladder esgotada): tenta estes, do mais para o menos comum.
+GENERICOS = [
+    "/S",
+    "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-",
+    "/quiet /norestart",
+    "/silent /norestart",
+    "/qn /norestart",
+    '/s /v"/qn REBOOT=ReallySuppress"',
+]
+
+
+def _chave_tipo(tipo: str) -> str:
+    return "Burn" if tipo in ("Burn", "WiX Burn") else tipo
+
+
+def candidatos_args(msi: Path, exe: Path) -> list:
+    """Lista ordenada de argumentos silenciosos a tentar para o .exe embutido.
+
+    1) '<nome>.exe.args' ao lado do MSI: se existir, vale SÓ ele (1 argumento por linha = 1 tentativa);
+    2) senão: o gravado no MSI, o detectado no .exe, a escada do tipo e, por fim, os genéricos."""
+    lado = msi.with_name(msi.stem + ".exe.args")
+    if lado.is_file():
+        linhas = [l for l in _ler_linhas_args(lado) if l.upper() != "IGNORAR"]
+        if linhas:
+            return linhas
+    lista: list = []
     try:
         alvo = msi_texto(msi, "SELECT `Target` FROM `CustomAction` WHERE `Action`='RunInstall'")
     except OSError:
         alvo = None
     if alvo:
-        return alvo
+        lista.append(alvo)
     achado = detectar_instalador(exe)
-    return achado[1] if achado else ""
+    tipo = achado[0] if achado else tipo_por_args(alvo or "")
+    if achado:
+        lista.append(achado[1])
+    lista += ESCADAS.get(_chave_tipo(tipo), [])
+    lista += GENERICOS
+    vistos, final = set(), []
+    for a in lista:
+        k = a.strip().lower()
+        if k and k not in vistos:
+            vistos.add(k)
+            final.append(a.strip())
+    return final
 
 
-def _args_com_log(args: str, tipo: str, log_file: Path) -> str:
+def _args_com_log(args: str, tipo: str, log_file: Path, n: int = 1) -> str:
     """Pede ao instalador um log próprio (Burn e Inno suportam) - ajuda a diagnosticar falhas."""
-    destino = log_file.with_suffix(".instalador.log")
+    destino = log_file.with_suffix(".instalador.log" if n == 1 else f".instalador{n}.log")
     if "/log" in args.lower():
         return args
     if tipo == "Burn":
@@ -526,8 +624,38 @@ def _args_com_log(args: str, tipo: str, log_file: Path) -> str:
     return args
 
 
+def _fazer_tick():
+    """Callback de sinal de vida (status.txt, tela gráfica e linha no console a cada 15 s)."""
+    ultimo = [0]
+
+    def tick(seg: int) -> None:
+        ESTADO["acao"] = "instalador embutido"
+        gravar_status()
+        if _CB_BATIMENTO:
+            with contextlib.suppress(Exception):
+                _CB_BATIMENTO(seg, ESTADO["acao"])
+        if seg - ultimo[0] >= 15:
+            ultimo[0] = seg
+            print(f"        {ts()}{CINZA}... ainda instalando ({seg}s){RESET}", flush=True)
+    return tick
+
+
+def _rejeitou_argumentos(res, codigo: int) -> bool:
+    """True quando vale tentar o próximo argumento: o instalador abriu tela e travou, rejeitou o
+    argumento ou saiu na hora com erro. NÃO tenta de novo se ele já estava instalando e falhou."""
+    if res.motivo == "ui_travada":
+        return True
+    if res.motivo == "timeout":
+        return False
+    c = codigo & 0xFFFFFFFF
+    if c in (87, 1639):
+        return True
+    return res.duracao < 6 and c not in (1618,)
+
+
 def instalar_embutido(msi: Path, log_file: Path) -> int:
-    """Extrai o .exe de dentro do MSI e executa fora do msiexec. Devolve o código de saída real."""
+    """Extrai o .exe de dentro do MSI e executa fora do msiexec, 100% oculto, esperando a ÁRVORE de
+    processos. Se o instalador abrir uma tela e travar, encerra e tenta o próximo argumento silencioso."""
     tmp = Path(tempfile.mkdtemp(prefix="msi_direto_"))
     anotacoes: list = []
 
@@ -539,35 +667,60 @@ def instalar_embutido(msi: Path, log_file: Path) -> int:
         exe = tmp / f"{msi.stem}.exe"        # mesmo nome do .exe original
         if shutil.disk_usage(tmp).free < msi.stat().st_size * 1.15 + (200 << 20):
             anotar("Espaço insuficiente em %TEMP% para extrair o instalador.")
-            print(f"        {VERMELHO}[ERRO] Sem espaço em disco para extrair o instalador.{RESET}")
+            aviso("Sem espaço em disco para extrair o instalador.", "erro")
             return 112
         t0 = time.time()
         if not msi_extrair_stream(msi, "SELECT `Data` FROM `Binary` WHERE `Name`='SetupExe'", exe):
             anotar("Falha ao extrair o .exe da tabela Binary.")
             return 1620
         anotar(f"Instalador extraído ({exe.stat().st_size // 1048576} MB em {time.time() - t0:.0f}s)")
-        args = _args_embutidos(msi, exe)
-        if not args:
-            anotar(f"Argumentos silenciosos desconhecidos. Crie '{msi.stem}.exe.args' ao lado do MSI.")
-            print(f"        {VERMELHO}[ERRO] Argumentos silenciosos desconhecidos; "
-                  f"crie '{msi.stem}.exe.args'.{RESET}")
+        candidatos = candidatos_args(msi, exe)[:MAX_TENTATIVAS_ARGS]
+        if not candidatos:
+            anotar(f"Sem argumentos silenciosos. Crie '{msi.stem}.exe.args' ao lado do MSI.")
+            aviso(f"Argumentos silenciosos desconhecidos; crie '{msi.stem}.exe.args'.", "erro")
             return 87
-        tipo = tipo_por_args(args)
-        ESTADO["tipo"] = tipo
-        args = _args_com_log(args, tipo, log_file)
-        linha = f'"{exe}" {args}'
-        anotar(f"Tipo: {tipo or 'desconhecido'} | comando: {linha}")
+        anotar("Tentativas de argumentos: " + " || ".join(candidatos))
 
-        def rodar() -> int:
-            proc = subprocess.Popen(linha, cwd=str(tmp))
-            cod = aguardar_com_status(proc, None, TIMEOUT_EXE_MIN * 60)
-            anotar(f"Código de saída: {cod} (0x{cod & 0xFFFFFFFF:08X})")
-            return cod
+        codigo = 1
+        for n, args in enumerate(candidatos, start=1):
+            if not ex.aguardar_msi_livre(ESPERA_MSI_LIVRE_S):
+                anotar("Windows Installer continuou ocupado por muito tempo.")
+            tipo = tipo_por_args(args)
+            ESTADO["tipo"] = tipo
+            linha_cmd = f'"{exe}" {_args_com_log(args, tipo, log_file, n)}'
+            anotar(f"Tentativa {n}/{len(candidatos)} | tipo: {tipo or 'desconhecido'} | {linha_cmd}")
+            if len(candidatos) > 1 and n > 1:
+                aviso(f"tentativa {n}/{len(candidatos)}: {args}", "aviso")
+            guarda: dict = {}
+            tick = _fazer_tick()
 
-        return _com_retentativa(rodar)
+            def rodar() -> int:
+                res = ex.executar_arvore(
+                    linha_cmd, str(tmp), TIMEOUT_EXE_MIN * 60, tick=tick,
+                    ocultar=OCULTAR_JANELAS, vigiar_ui=VIGIAR_UI, ui_ocioso_s=UI_OCIOSO_S,
+                    pos_ocioso_s=POS_OCIOSO_S, pos_max_s=POS_MAX_S,
+                    ao_janela=lambda d: (anotar(f"Janela detectada e ocultada: {d}"),
+                                         aviso(f"janela ocultada: {d}", "aviso")))
+                guarda["res"] = res
+                anotar(f"Código de saída: {res.codigo} (0x{res.codigo & 0xFFFFFFFF:08X}) | motivo: {res.motivo} | "
+                       f"{res.duracao:.0f}s{' | deixou processos filhos' if res.deixou_filhos else ''}")
+                return res.codigo
+
+            codigo = _com_retentativa(rodar)
+            res = guarda["res"]
+            if codigo in CODIGOS_OK:
+                return codigo
+            if res.motivo == "ui_travada":
+                aviso("o instalador abriu uma tela e esperou clique "
+                      f"({'; '.join(res.janelas[-2:]) or 'janela sem título'}); encerrado.", "aviso")
+                ex.aguardar_msi_livre(120)
+            if n < len(candidatos) and _rejeitou_argumentos(res, codigo):
+                continue
+            break
+        return codigo
     except Exception as exc:  # noqa: BLE001
-        anotar(f"EXCEÇÃO: {exc}")
-        print(f"        {VERMELHO}[ERRO] {exc}{RESET}")
+        anotar(f"EXCEÇÃO: {exc}\n{traceback.format_exc()}")
+        aviso(f"{exc}", "erro")
         return 1
     finally:
         with contextlib.suppress(Exception):
@@ -592,7 +745,9 @@ def instalar_lista(itens: list[tuple[Path, list[Path]]], callback=None, cancelar
             with contextlib.suppress(Exception):
                 callback(ev, **kw)
 
+    global _CB_EVENTO
     _CB_BATIMENTO = (lambda seg, etapa: emit("batimento", seg=seg, etapa=etapa)) if callback else None
+    _CB_EVENTO = callback
     try:
         LOG_DIR.mkdir(exist_ok=True)
         carimbo = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -670,6 +825,7 @@ def instalar_lista(itens: list[tuple[Path, list[Path]]], callback=None, cancelar
         return falhas, reboot
     finally:
         _CB_BATIMENTO = None
+        _CB_EVENTO = None
 
 
 # ----------------------------------------------------------------------------
@@ -749,18 +905,21 @@ def detectar_instalador(exe: Path) -> Optional[tuple]:
 
 
 def argumentos_do_exe(exe: Path) -> Optional[tuple]:
-    """(origem, args). Arquivo '<nome>.exe.args' (1ª linha) tem prioridade;
-    conteúdo 'IGNORAR' pula o arquivo. Sem arquivo, tenta detectar o instalador."""
-    sidecar = exe.with_name(exe.name + ".args")
-    if sidecar.is_file():
-        linhas = sidecar.read_text(encoding="utf-8-sig", errors="replace").strip().splitlines()
-        txt = linhas[0].strip() if linhas else ""
-        if txt.upper() == "IGNORAR":
-            return "IGNORAR", ""
-        if txt:
-            return f"arquivo {sidecar.name}", txt
+    """(origem, args, conhecido). '<nome>.exe.args' (1ª linha útil) tem prioridade; 'IGNORAR' pula o
+    arquivo. Sem arquivo, detecta o instalador. Tipo desconhecido NÃO é mais descartado: converte com
+    o 1º argumento genérico e, na hora de instalar, a escada de argumentos + vigia de tela resolvem
+    (conhecido=False => o .exe original é mantido)."""
+    lado = exe.with_name(exe.name + ".args")
+    if lado.is_file():
+        linhas = _ler_linhas_args(lado)
+        if linhas and linhas[0].upper() == "IGNORAR":
+            return "IGNORAR", "", True
+        if linhas:
+            return f"arquivo {lado.name}", linhas[0], True
     achado = detectar_instalador(exe)
-    return achado if achado else None
+    if achado:
+        return achado[0], achado[1], True
+    return "tipo desconhecido (escada genérica na instalação)", GENERICOS[0], False
 
 
 def localizar_wix() -> Optional[tuple]:
@@ -797,7 +956,7 @@ def versao_exe(exe: Path) -> str:
 
 
 def _rodar(cmd: list, log: list) -> int:
-    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    r = ex.rodar_oculto(cmd, capture_output=True, text=True, errors="replace")
     log.append("> " + " ".join(f'"{c}"' if " " in c else c for c in cmd))
     log.append(r.stdout or "")
     log.append(r.stderr or "")
@@ -809,6 +968,9 @@ def construir_msi(exe: Path, msi: Path, args: str, wix: tuple, log_path: Path) -
     candle, light = wix
     log: list = []
     try:
+        if exe.stat().st_size >= LIMITE_BINARY_BYTES:
+            return False, (f"o .exe tem {exe.stat().st_size / 2**30:.1f} GB; acima de ~2 GB não cabe "
+                           "num MSI (deixe-o como .exe e instale por outro meio)")
         with tempfile.TemporaryDirectory(prefix="exe2msi_") as tmp_s:
             tmp = Path(tmp_s)
             wxs, obj = tmp / "pkg.wxs", tmp / "obj"
@@ -838,28 +1000,45 @@ def construir_msi(exe: Path, msi: Path, args: str, wix: tuple, log_path: Path) -
             pass
 
 
+def _sha256(arq: Path) -> str:
+    h = hashlib.sha256()
+    with open(arq, "rb") as f:
+        for bloco in iter(lambda: f.read(1 << 20), b""):
+            h.update(bloco)
+    return h.hexdigest()
+
+
 def verificar_msi(msi: Path, exe: Path) -> bool:
-    """Confere se o MSI é válido, contém o .exe (tabela Binary) E tem ao menos um Component
-    ligado à Feature (sem isso o Windows Installer aborta com 1603). Só então o .exe pode ser apagado."""
+    """Só devolve True se TODAS as conferências passarem (e só então o .exe pode ser apagado):
+       1) arquivo OLE válido e maior que o .exe;  2) tabela Binary com 'SetupExe';
+       3) Component + FeatureComponents (sem isso o Windows Installer aborta com 1603);
+       4) o stream embutido tem EXATAMENTE o tamanho do .exe;
+       5) até VERIFICAR_HASH_ATE_MB: o SHA-256 do .exe extraído de dentro do MSI é idêntico ao original.
+    Tudo via msi.dll (sem PowerShell, sem janela)."""
     try:
-        if not msi.is_file() or msi.stat().st_size < exe.stat().st_size:
+        tam_exe = exe.stat().st_size
+        if not msi.is_file() or msi.stat().st_size < tam_exe:
             return False
         with open(msi, "rb") as f:
             if f.read(8) != bytes.fromhex("D0CF11E0A1B11AE1"):  # cabeçalho OLE de um MSI
                 return False
-        caminho = str(msi.resolve()).replace("'", "''")
-        ps = ("$i=New-Object -ComObject WindowsInstaller.Installer;"
-              f"$d=$i.OpenDatabase('{caminho}',0);"
-              "$v=$d.OpenView('SELECT Name FROM Binary');$v.Execute();"
-              "$r=$v.Fetch();if($r){$r.StringData(1)};"
-              "$v=$d.OpenView('SELECT Component FROM Component');$v.Execute();"
-              "if($v.Fetch()){'TEM_COMPONENTE'};"
-              "$v=$d.OpenView('SELECT Feature_ FROM FeatureComponents');$v.Execute();"
-              "if($v.Fetch()){'TEM_FEATURE_COMPONENTE'}")
-        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                           capture_output=True, text=True, errors="replace", timeout=120)
-        saida = r.stdout or ""
-        return all(chave in saida for chave in ("SetupExe", "TEM_COMPONENTE", "TEM_FEATURE_COMPONENTE"))
+        sql_bin = "SELECT `Data` FROM `Binary` WHERE `Name`='SetupExe'"
+        if msi_texto(msi, "SELECT `Name` FROM `Binary` WHERE `Name`='SetupExe'") is None:
+            return False
+        if msi_texto(msi, "SELECT `Component` FROM `Component`") is None:
+            return False
+        if msi_texto(msi, "SELECT `Feature_` FROM `FeatureComponents`") is None:
+            return False
+        if msi_tamanho_stream(msi, sql_bin) != tam_exe:
+            return False
+        if tam_exe <= VERIFICAR_HASH_ATE_MB << 20:
+            with tempfile.TemporaryDirectory(prefix="verif_") as t:
+                copia = Path(t) / "extraido.bin"
+                if not msi_extrair_stream(msi, sql_bin, copia):
+                    return False
+                if _sha256(copia) != _sha256(exe):
+                    return False
+        return True
     except Exception:  # noqa: BLE001
         return False
 
@@ -923,6 +1102,12 @@ def msi_texto(caminho: Path, sql: str) -> Optional[str]:
             if rc:
                 raise OSError(rc, f"MsiRecordGetString falhou ({rc})")
             return buf.value
+
+
+def msi_tamanho_stream(caminho: Path, sql: str) -> int:
+    """Tamanho (bytes) do fluxo binário da 1ª coluna da 1ª linha; 0 se não houver."""
+    with _msi_primeiro_registro(caminho, sql) as (api, rec):
+        return int(api.MsiRecordDataSize(rec.value, 1)) if rec is not None else 0
 
 
 def msi_extrair_stream(caminho: Path, sql: str, destino: Path) -> bool:
@@ -1068,27 +1253,28 @@ def converter_exes(simular: bool = False, manter: bool = False) -> tuple:
         ESTADO["conversoes"].append((nome, status, detalhe))
         print(f"        {ts()}{cor}[{status}]{RESET} {detalhe}\n")
         gravar_status()
+        nivel = {VERDE: "ok", VERMELHO: "erro", AMARELO: "aviso"}.get(cor, "info")
+        evento("aviso", msg=f"[{status.strip()}] {detalhe}", nivel=nivel)
 
     for i, (pasta, exe) in enumerate(exes, start=1):
         nome = f"{pasta.name}\\{exe.relative_to(pasta)}"
         print(f"  {ts()}{CIANO}[{i}/{len(exes)}]{RESET} {nome} {CINZA}({exe.stat().st_size // 1048576} MB){RESET}")
         ESTADO.update(atual=i, pacote=nome, acao="convertendo")
         gravar_status()
+        evento("prep_item", i=i, total=len(exes), nome=nome)
         msi = exe.with_suffix(".msi")
 
-        escolha = argumentos_do_exe(exe)
-        if escolha is None:
-            pendencias += 1
-            registrar(nome, "PULADO", f"tipo de instalador desconhecido; crie '{exe.name}.args' "
-                      f"com os argumentos silenciosos (ou 'IGNORAR'). .exe mantido", AMARELO)
-            continue
-        origem, args = escolha
+        origem, args, conhecido = argumentos_do_exe(exe)
         if origem == "IGNORAR":
             registrar(nome, "IGNORADO", "marcado como IGNORAR no .args", CINZA)
             continue
         if msi.exists():
-            pendencias += 1
-            registrar(nome, "PULADO", f"já existe {msi.name} com esse nome; .exe mantido", AMARELO)
+            if pacote_embutido(msi):
+                registrar(nome, "JÁ FEITO", f"{msi.name} já foi gerado antes por este programa", CINZA)
+            else:
+                pendencias += 1
+                registrar(nome, "PULADO", f"já existe {msi.name} (de outra origem) com esse nome; "
+                          f".exe mantido", AMARELO)
             continue
         if any(c.suffix.lower() == ".cab" for c in exe.parent.iterdir() if c.is_file()):
             pendencias += 1
@@ -1114,12 +1300,13 @@ def converter_exes(simular: bool = False, manter: bool = False) -> tuple:
             msi.unlink(missing_ok=True)
             continue
 
-        if EXCLUIR_EXE_APOS_CONVERTER and not manter:
+        if not conhecido:
+            registrar(nome, " OK ", f"{msi.name} criado e verificado. Tipo de instalador DESCONHECIDO: o "
+                      f".exe foi MANTIDO. Na instalação serão tentados vários argumentos silenciosos; "
+                      f"se um deles funcionar, grave-o em '{exe.name}.args'", AMARELO)
+        elif EXCLUIR_EXE_APOS_CONVERTER and not manter:
             try:
-                exe.unlink()
-                sidecar = exe.with_name(exe.name + ".args")
-                if sidecar.exists():
-                    sidecar.unlink()
+                exe.unlink()      # o '<nome>.exe.args' é MANTIDO: a instalação lê as tentativas dele
                 registrar(nome, " OK ", f"{msi.name} criado e verificado; .exe excluído", VERDE)
             except OSError as exc:
                 pendencias += 1
@@ -1261,8 +1448,22 @@ def menu() -> None:
         pausar()
 
 
-def abrir_interface() -> bool:
-    """Abre a tela gráfica de seleção. Devolve False se não for possível (cai no menu de texto)."""
+def preparar_pacotes(cb=None, manter: bool = False) -> tuple:
+    """Repara MSIs antigos e converte .exe -> .msi. 'cb' recebe eventos da tela gráfica.
+    Devolve (reparados, exes_encontrados, pendencias)."""
+    global _CB_EVENTO
+    _CB_EVENTO = cb
+    try:
+        reparados, pend_reparo = reparar_msis_antigos()
+        encontrados, pend_conv = converter_exes(manter=manter)
+        return reparados, encontrados, pend_reparo + pend_conv
+    finally:
+        _CB_EVENTO = None
+
+
+def abrir_interface(preparar=None) -> bool:
+    """Abre a tela gráfica. 'preparar(callback)' (opcional) roda ANTES da seleção, dentro da própria tela
+    (conversão/reparo de .exe -> .msi), para o técnico ver só ela. False = não foi possível abrir."""
     global GUI_ATIVA
     try:
         import tela_instalacao   # mesma pasta deste arquivo
@@ -1285,6 +1486,7 @@ def abrir_interface() -> bool:
             "titulo": "Instalador Automático MSI", "versao": VERSAO, "desenvolvedor": DESENVOLVEDOR,
             "admin": eh_admin(), "obter_dirs": descobrir_diretorios,
             "classificar": classificar_pacote, "instalar": instalar, "abrir_logs": abrir_logs,
+            "preparar": preparar,
         })
     except Exception as exc:  # noqa: BLE001
         GUI_ATIVA = False
@@ -1353,6 +1555,8 @@ def ler_argumentos() -> argparse.Namespace:
                     help="usa o menu de texto em vez da tela gráfica")
     ap.add_argument("--via-msiexec", action="store_true",
                     help="instala os MSI gerados pelo programa via msiexec (padrão: roda o .exe embutido direto)")
+    ap.add_argument("--ver-janelas", action="store_true",
+                    help="diagnóstico: NÃO oculta nem encerra telas dos instaladores (só registra título/classe)")
     ap.add_argument("--lancador", action="store_true", help=argparse.SUPPRESS)  # uso interno do .bat
     ap.add_argument("--menu", action="store_true", help=argparse.SUPPRESS)      # uso interno do .bat
     ap.add_argument("--raiz", default=None,
@@ -1363,11 +1567,50 @@ def ler_argumentos() -> argparse.Namespace:
     return ap.parse_args()
 
 
+def _garantir_streams() -> None:
+    """Com pythonw.exe (sem console) sys.stdout/sys.stderr são None e qualquer print() derrubaria o
+    programa. Redireciona para logs\\console.log."""
+    global SEM_CONSOLE
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    SEM_CONSOLE = True
+    try:
+        LOG_DIR.mkdir(exist_ok=True)
+        f = open(LOG_DIR / "console.log", "a", encoding="utf-8", buffering=1)
+    except OSError:
+        f = open(os.devnull, "w", encoding="utf-8")
+    if sys.stdout is None:
+        sys.stdout = f
+    if sys.stderr is None:
+        sys.stderr = f
+    desativar_cores()
+
+
+def _erro_fatal(exc: BaseException) -> None:
+    """Registra o erro e, sem console, mostra uma caixa de mensagem (senão ninguém veria)."""
+    texto = traceback.format_exc()
+    with contextlib.suppress(Exception):
+        LOG_DIR.mkdir(exist_ok=True)
+        (LOG_DIR / "erro_fatal.txt").write_text(f"{datetime.now():%d/%m/%Y %H:%M:%S}\n{texto}", encoding="utf-8")
+    print(texto)
+    if SEM_CONSOLE:
+        with contextlib.suppress(Exception):
+            import tkinter
+            from tkinter import messagebox
+            raiz = tkinter.Tk()
+            raiz.withdraw()
+            messagebox.showerror(TITULO, f"Erro inesperado:\n{exc}\n\nDetalhes em:\n{LOG_DIR / 'erro_fatal.txt'}")
+            raiz.destroy()
+
+
 def main() -> None:
-    global AUTO, ANIMACAO, BASE, MODO_DIRETO
+    global AUTO, ANIMACAO, BASE, MODO_DIRETO, OCULTAR_JANELAS, VIGIAR_UI
     args = ler_argumentos()
+    _garantir_streams()
     if args.via_msiexec:
         MODO_DIRETO = False
+    if args.ver_janelas:
+        OCULTAR_JANELAS = VIGIAR_UI = False
     if args.raiz:
         BASE = Path(args.raiz).resolve()
     if args.auto:
@@ -1388,18 +1631,31 @@ def main() -> None:
     if AUTO:
         sys.exit(modo_automatico(args))
     try:
-        if CONVERTER_EXE and not args.sem_converter:
-            limpar_tela()
-            reparados, pend_reparo = reparar_msis_antigos()
-            encontrados, pend_conv = converter_exes(manter=args.manter_exe)
-            # só pausa se houve problema para ler; com a tela gráfica o fluxo segue direto
-            if pend_reparo or pend_conv or ((encontrados or reparados) and args.console):
-                pausar()
-        if args.console or not abrir_interface():
+        usar_prep = CONVERTER_EXE and not args.sem_converter
+        if args.console:
+            if usar_prep:
+                limpar_tela()
+                reparados, pend_reparo = reparar_msis_antigos()
+                encontrados, pend_conv = converter_exes(manter=args.manter_exe)
+                if pend_reparo or pend_conv or encontrados or reparados:
+                    pausar()
             tela_apresentacao()
             menu()
+        else:
+            prep = (lambda cb: preparar_pacotes(cb, args.manter_exe)) if usar_prep else None
+            if not abrir_interface(prep):
+                if SEM_CONSOLE:
+                    raise RuntimeError("Não foi possível abrir a tela gráfica (tkinter ausente?). "
+                                       "Veja logs\\console.log ou use INSTALAR.bat --console.")
+                if usar_prep:
+                    preparar_pacotes(None, args.manter_exe)
+                tela_apresentacao()
+                menu()
     except KeyboardInterrupt:
         print(f"\n\n{AMARELO}Interrompido pelo usuário.{RESET}")
+    except Exception as exc:  # noqa: BLE001
+        _erro_fatal(exc)
+        sys.exit(3)
     limpar_tela()
     print(f"\n{CIANO}Obrigado por usar o {TITULO}!{RESET}")
     print(f"{DIM}{CINZA}desenvolvido por {DESENVOLVEDOR}{RESET}\n")

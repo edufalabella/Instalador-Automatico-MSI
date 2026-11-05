@@ -423,7 +423,7 @@ Não existe conversão real de EXE para MSI. O programa cria um MSI que **conté
 | Advanced Installer | `/exenoui /qn /norestart` |
 | InstallShield | `/s /v"/qn REBOOT=ReallySuppress"` |
 
-3. Tipo desconhecido: **não converte e não apaga** — avisa e conta como pendência (código de saída 6).
+3. Tipo desconhecido: **(v2.1)** converte com argumentos genéricos e **mantém o `.exe`**; na instalação a escada de argumentos + vigia de tela tentam achar o que funciona (veja a seção v2.1).
 
 ### Quando o .exe é apagado
 
@@ -470,3 +470,67 @@ Na raiz fica só o **`INSTALAR.bat`**; tudo o mais está em `#SISTEMA`.
 - `INSTALAR.bat` sem parâmetros = modo automático. Outros modos: `--menu`, `--listar`, `--status`, `--pastas`, `--sem-pausa`, `--manter-exe`.
 - Para esconder a pasta de quem navega pela raiz (opcional): `attrib +h +s "#SISTEMA"` (para desfazer: `attrib -h -s "#SISTEMA"`). É só visual: quem digitar o caminho ainda acessa.
 - Para impedir de verdade, use permissões NTFS/compartilhamento: usuários comuns só com **leitura e execução** na raiz, e **modificação** apenas para a equipe de TI.
+
+
+---
+
+## 🛡️ v2.1 — Instalação 100% silenciosa e à prova de telas
+
+**Objetivo:** a única janela que o técnico vê é a tela gráfica do programa. Nenhum assistente de instalador, console, PowerShell ou aviso de segurança deve aparecer nem exigir clique.
+
+### O que causava as telas e os erros (e o que mudou)
+
+| Causa | Correção na v2.1 |
+|---|---|
+| Argumento silencioso errado/desconhecido → o instalador abria o assistente e ficava esperando clique | **Escada de argumentos**: se uma tentativa abre tela e trava (ou rejeita o argumento), ela é encerrada e o próximo argumento é tentado (até `MAX_TENTATIVAS_ARGS`). Há escada por tipo (Inno, NSIS, Burn, Advanced Installer, InstallShield, Qt IFW) e uma lista genérica para tipo desconhecido |
+| Instalador que relança um processo filho e sai com código 0 → o programa achava que terminou e seguia (colisão, 1618, telas) | O instalador roda dentro de um **Job Object**: só termina quando o processo **e todos os filhos** terminam. Entre um pacote e outro espera o Windows Installer ficar livre (mutex `_MSIExecute`) |
+| Janela que o instalador criava mesmo em modo silencioso | Toda janela criada pela árvore do instalador é **ocultada na hora** e registrada (título/classe) no log e na tela |
+| Instalador parado numa tela esperando clique (travava horas) | **Vigia**: tela aberta + zero atividade de CPU/disco por `UI_OCIOSO_S` (60 s) → encerra a árvore, registra a janela e tenta o próximo argumento. Se todas falharem: `FALHA (código 1602 - abriu tela e esperou interação)` com o título da janela no log |
+| Tipo desconhecido era **descartado** na conversão | Agora converte com argumentos genéricos e **mantém o `.exe`** (nunca apaga um tipo desconhecido) |
+| Console/PowerShell piscando (`taskkill`, `candle`, `light`, `powershell`) | Todo subprocesso nasce oculto; a verificação do MSI não usa mais PowerShell (lê direto via `msi.dll`) |
+| Console preto do `.bat` aberto durante tudo | No modo gráfico o `.bat` fica oculto e abre a tela com `pythonw.exe`. Se faltar `pythonw`/`tkinter`, cai no console visível |
+| Conversão rodava **antes** de a tela abrir (sem nada na tela) | A tela abre na hora e mostra "Preparando os pacotes…" com o andamento da conversão |
+| "Abrir arquivo – Aviso de segurança" em arquivos baixados | `Unblock-File` em `#SISTEMA` + `SEE_MASK_NOZONECHECKS=1` nos processos filhos |
+| Python não instalava por 1618 (Windows Update) | `INICIAR.bat` espera 30 s e tenta de novo (até 5×); log em `logs\python_instalacao.log` |
+| Verificação do MSI só olhava a estrutura | Agora também confere **tamanho exato** e **SHA‑256** do `.exe` embutido (até `VERIFICAR_HASH_ATE_MB`) antes de apagar o original; avisa se o `.exe` passa de ~2 GB |
+
+> Única janela do Windows que ainda pode aparecer: o **UAC** (pedido de administrador). Para eliminá‑lo, execute o `INSTALAR.bat` já como administrador / tarefa agendada com privilégios mais altos.
+
+### Arquivo `.args` agora aceita VÁRIAS linhas
+
+```
+nome_do_instalador.exe.args
+-------------------------------
+# comentário (linhas com # ou ; são ignoradas)
+/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-
+/SILENT /SUPPRESSMSGBOXES /NORESTART /SP-
+```
+
+Cada linha é **uma tentativa**, na ordem. Se o arquivo existir, **só** as linhas dele são usadas (você assume o controle). `IGNORAR` pula o `.exe`. O `.args` agora **não é mais apagado** após a conversão (a instalação lê as tentativas dele).
+
+Para MSI de verdade (não gerados pelo programa): `<nome>.mst` ao lado do MSI vira `TRANSFORMS=`, e `<nome>.msi.args` (1ª linha) acrescenta propriedades, ex.: `ACCEPTEULA=1`.
+
+### Como descobrir qual instalador abre tela
+
+1. Rode `INSTALAR.bat --ver-janelas`: **não** oculta nem encerra nada, só registra no log o **título e a classe** de cada janela que o instalador abrir.
+2. Abra `logs\<Pasta>_<nome>_<data>.log` — procure `Janela detectada` e `Tentativa n/N` (mostra o comando exato usado e o código de saída).
+3. Descobriu o argumento certo? Grave em `<nome>.exe.args`.
+
+### Novas configurações (topo do `instalador_msi.py`)
+
+| Variável | Padrão | Função |
+|---|:---:|---|
+| `OCULTAR_JANELAS` | `True` | Oculta qualquer janela criada pelo instalador |
+| `VIGIAR_UI` | `True` | Encerra e tenta o próximo argumento se a tela travar |
+| `UI_OCIOSO_S` | `60` | Segundos de "tela aberta sem atividade" para considerar travado (aumente para instaladores web que baixam muito com pouca CPU/disco) |
+| `MAX_TENTATIVAS_ARGS` | `5` | Tentativas de argumentos por instalador |
+| `POS_OCIOSO_S` / `POS_MAX_S` | `45` / `600` | Espera pelos processos filhos depois que o principal sai |
+| `ESPERA_MSI_LIVRE_S` | `900` | Espera máxima pelo Windows Installer entre pacotes |
+| `VERIFICAR_HASH_ATE_MB` | `300` | Confere SHA‑256 do `.exe` dentro do MSI até este tamanho |
+
+### Limites que continuam valendo
+
+- Se o instalador **não tem** modo silencioso (ou exige chave/aceite próprio), nenhuma escada resolve: use `.args`/`.mst` específicos ou deixe o pacote fora do lote.
+- Se o instalador mostra uma tela **de verdade ocupada** (CPU/disco ativos), ela é apenas ocultada, não encerrada.
+- Erros fatais da tela gráfica (sem console) aparecem numa caixa de mensagem e ficam em `logs\erro_fatal.txt`; a saída de texto vai para `logs\console.log`.
+- `INSTALAR.bat` continua abrindo um console por uma fração de segundo antes do UAC (limitação de qualquer `.bat`; para evitar, use um atalho com "Executar: Minimizado" ou um `.exe` lançador).
