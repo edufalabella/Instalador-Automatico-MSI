@@ -165,6 +165,8 @@ def ligar(widget, evento, fn):
 # Tela principal
 # ----------------------------------------------------------------------------
 class Tela:
+    NOMES_ETAPAS = ("Conversão", "Validação", "Instalação")
+
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self._dpi()
@@ -185,6 +187,12 @@ class Tela:
         self.checks_msi: dict[Path, Check] = {}
         self.setas: dict[Path, tk.Label] = {}
         self.info: dict[Path, tuple] = {}
+        self.val: dict[Path, tuple] = {}          # msi -> (nivel, resumo) da validação
+        self.bloqueados: set = set()              # msi reprovados: não podem ser selecionados
+        self.fase = ""                            # "prep" (conversão/validação) ou "inst"
+        self._val_problemas = False
+        self._prog_i = self._prog_total = 0
+        self._det_base = ""
         self.direto = tk.BooleanVar(value=True)
         self.rodando = False
         self.cancelar = threading.Event()
@@ -307,6 +315,9 @@ class Tela:
         self.l_pastas.pack(fill="x", padx=px(20))
         self.l_tam = tk.Label(dir_, text="", bg=C["card"], fg=C["suave"], font=self.F(10), anchor="w")
         self.l_tam.pack(fill="x", padx=px(20), pady=(px(4), 0))
+        self.l_val = tk.Label(dir_, text="", bg=C["card"], fg=C["suave"], font=self.F(10), anchor="w",
+                              justify="left", wraplength=px(255))
+        self.l_val.pack(fill="x", padx=px(20), pady=(px(4), 0))
 
         opt = tk.Frame(dir_, bg=C["card"])
         opt.pack(fill="x", padx=px(20), pady=(px(18), 0))
@@ -390,10 +401,21 @@ class Tela:
         antigos = dict(self.sel)
         self.sel = {}
         self.info = {}
+        self.val, self.bloqueados = {}, set()
+        pre = bool(self.cfg.get("preselecionar"))
+        leitor = self.cfg.get("status_validacao")
         for pasta, msis in self.dirs:
             self.expandido.setdefault(pasta, True)
             for m in msis:
-                self.sel[m] = antigos.get(m, False)
+                try:
+                    st = leitor(m) if leitor else None
+                except Exception:
+                    st = None
+                if st:
+                    self.val[m] = st
+                    if st[0] == "erro":
+                        self.bloqueados.add(m)
+                self.sel[m] = False if m in self.bloqueados else antigos.get(m, pre)
                 try:
                     self.info[m] = self.cfg["classificar"](m)
                 except Exception:
@@ -455,16 +477,27 @@ class Tela:
             w.bind("<Button-1>", lambda e, p=pasta: self._alternar_pasta(p))
         linha.bind("<Button-1>", lambda e, p=pasta: self._alternar_pasta(p))
 
+    BADGES_VAL = {"ok": ("✓ VÁLIDO", "#6EE7B7", "#123A31"),
+                  "aviso": ("⚠ AVISO", "#FCD34D", "#3D3210"),
+                  "erro": ("✕ BLOQUEADO", "#FCA5A5", "#4A1D24")}
+
     def _linha_msi(self, pasta, msi):
         base = C["linha"]
-        linha = tk.Frame(self.inner, bg=base, cursor="hand2")
+        st = self.val.get(msi)
+        bloqueado = msi in self.bloqueados
+        linha = tk.Frame(self.inner, bg=base, cursor="arrow" if bloqueado else "hand2")
         linha.pack(fill="x", pady=(1, 0))
         tk.Frame(linha, bg=base, width=px(40)).pack(side="left")
-        ck = Check(linha, base, 18)
-        ck.pack(side="left", padx=(px(2), px(12)), pady=px(9))
-        self.checks_msi[msi] = ck
+        if bloqueado:      # reprovado na validação: sem caixa de seleção
+            tk.Label(linha, text="✕", bg=base, fg=C["erro"], font=self.F(11, "bold"), width=2
+                     ).pack(side="left", padx=(px(2), px(10)), pady=px(9))
+        else:
+            ck = Check(linha, base, 18)
+            ck.pack(side="left", padx=(px(2), px(12)), pady=px(9))
+            self.checks_msi[msi] = ck
         nome = msi.stem
-        tk.Label(linha, text=nome, bg=base, fg=C["texto"], font=self.F(10), anchor="w").pack(side="left")
+        tk.Label(linha, text=nome, bg=base, fg=C["fraco"] if bloqueado else C["texto"], font=self.F(10),
+                 anchor="w").pack(side="left")
         try:
             rel = msi.parent.relative_to(pasta)
             if str(rel) != ".":
@@ -476,7 +509,20 @@ class Tela:
                  ).pack(side="right", padx=(0, px(16)))
         fg, bgc = ("#A5B4FC", "#262B63") if tag.startswith("EXE") else ("#6EE7B7", "#123A31")
         tk.Label(linha, text=f" {tag} ", bg=bgc, fg=fg, font=self.F(8, "bold")).pack(side="right", padx=px(8))
-        ligar(linha, "<Button-1>", lambda e, m=msi: self._alternar_msi(m))
+        if st:
+            txt, vfg, vbg = self.BADGES_VAL[st[0]]
+        else:
+            txt, vfg, vbg = "NÃO VALIDADO", C["fraco"], C["desab"]
+        tk.Label(linha, text=f" {txt} ", bg=vbg, fg=vfg, font=self.F(8, "bold")).pack(side="right", padx=(0, px(4)))
+        if not bloqueado:
+            ligar(linha, "<Button-1>", lambda e, m=msi: self._alternar_msi(m))
+        if st and st[0] in ("aviso", "erro"):      # o MOTIVO fica visível logo abaixo do pacote
+            sub = tk.Frame(self.inner, bg=base)
+            sub.pack(fill="x")
+            cor = C["erro"] if st[0] == "erro" else C["aviso"]
+            tk.Label(sub, text=("Não será instalado: " if st[0] == "erro" else "Atenção: ") + st[1], bg=base, fg=cor,
+                     font=self.F(9), anchor="w", justify="left", wraplength=px(640)
+                     ).pack(anchor="w", padx=(px(76), px(16)), pady=(0, px(8)))
 
     # ------------------------------------------------------------ seleção
     def _alternar_expansao(self, pasta):
@@ -486,11 +532,15 @@ class Tela:
         self.cv.yview_moveto(pos)
 
     def _alternar_msi(self, msi):
+        if msi in self.bloqueados:
+            return
         self.sel[msi] = not self.sel.get(msi, False)
         self._atualizar_estados()
 
     def _alternar_pasta(self, pasta):
-        msis = next(m for p, m in self.dirs if p == pasta)
+        msis = [m for m in next(m for p, m in self.dirs if p == pasta) if m not in self.bloqueados]
+        if not msis:
+            return
         novo = not all(self.sel.get(m) for m in msis)
         for m in msis:
             self.sel[m] = novo
@@ -500,14 +550,15 @@ class Tela:
         if self.rodando:
             return
         for m in self.sel:
-            self.sel[m] = valor
+            self.sel[m] = valor and m not in self.bloqueados
         self._atualizar_estados()
 
     def _atualizar_estados(self):
         for pasta, msis in self.dirs:
             if pasta in self.checks_pasta:
-                n = sum(1 for m in msis if self.sel.get(m))
-                self.checks_pasta[pasta].set(0 if n == 0 else (1 if n == len(msis) else 2))
+                livres = [m for m in msis if m not in self.bloqueados]
+                n = sum(1 for m in livres if self.sel.get(m))
+                self.checks_pasta[pasta].set(0 if n == 0 else (1 if n == len(livres) else 2))
         for m, ck in self.checks_msi.items():
             ck.set(1 if self.sel.get(m) else 0)
         escolhidos = [m for m, v in self.sel.items() if v]
@@ -517,6 +568,16 @@ class Tela:
         pastas_sel = sum(1 for _, ms in self.dirs if any(self.sel.get(m) for m in ms))
         self.l_pastas.configure(text=f"Pastas envolvidas:  {pastas_sel} de {len(self.dirs)}")
         self.l_tam.configure(text=f"Tamanho total:  {fmt_tam(sum(self.info.get(m, ('', 0))[1] for m in escolhidos))}")
+        nb = len(self.bloqueados)
+        na = sum(1 for v in self.val.values() if v[0] == "aviso")
+        if nb:
+            self.l_val.configure(text=f"✕ {nb} bloqueado(s) pela validação" + (f"   ⚠ {na} com aviso" if na else ""), fg=C["erro"])
+        elif na:
+            self.l_val.configure(text=f"⚠ {na} pacote(s) com aviso", fg=C["aviso"])
+        elif self.val:
+            self.l_val.configure(text="✓ todos os pacotes validados", fg=C["ok"])
+        else:
+            self.l_val.configure(text="")
         self.b_instalar.configurar(habilitado=n > 0 and self.cfg.get("admin", True))
 
     # ------------------------------------------------------------ tela 2: progresso
@@ -524,8 +585,17 @@ class Tela:
         self.v_prog = tk.Frame(self.corpo, bg=C["bg"])
         topo = tk.Frame(self.v_prog, bg=C["card"], highlightbackground=C["borda"], highlightthickness=1)
         topo.pack(fill="x")
+        self.f_etapas = tk.Frame(topo, bg=C["card"])
+        self.f_etapas.pack(fill="x", padx=px(22), pady=(px(16), 0))
+        self.l_etapas = []
+        for n, t in enumerate(self.NOMES_ETAPAS, start=1):
+            if n > 1:
+                tk.Label(self.f_etapas, text="›", bg=C["card"], fg=C["fraco"], font=self.F(11)).pack(side="left", padx=px(10))
+            lb = tk.Label(self.f_etapas, text=f"{n}  {t}", bg=C["card"], fg=C["fraco"], font=self.F(10))
+            lb.pack(side="left")
+            self.l_etapas.append(lb)
         self.p_titulo = tk.Label(topo, text="Instalando…", bg=C["card"], fg=C["texto"], font=self.F(16, "bold"))
-        self.p_titulo.pack(anchor="w", padx=px(22), pady=(px(18), 0))
+        self.p_titulo.pack(anchor="w", padx=px(22), pady=(px(10), 0))
         self.p_atual = tk.Label(topo, text="", bg=C["card"], fg=C["acento"], font=self.F(12, "bold"),
                                 anchor="w", justify="left")
         self.p_atual.pack(fill="x", padx=px(22), pady=(px(4), 0))
@@ -566,6 +636,19 @@ class Tela:
         self.b_voltar = Botao(self.acoes, "Voltar à seleção", self._voltar, "pri", 180, 40, self.F(10, "bold"))
         self.b_refazer = Botao(self.acoes, "Reinstalar falhas", self._reinstalar_falhas, "sec", 170, 40,
                                self.F(10))
+        self.b_continuar = Botao(self.acoes, "Continuar para a seleção", self.mostrar_selecao, "pri", 250, 40,
+                                 self.F(10, "bold"))
+
+    def _etapa(self, n: int):
+        """Destaca a etapa atual (1 Conversão, 2 Validação, 3 Instalação); as anteriores ficam com ✓."""
+        for i, lb in enumerate(self.l_etapas, start=1):
+            t = self.NOMES_ETAPAS[i - 1]
+            if i < n:
+                lb.configure(text=f"✓  {t}", fg=C["ok"], font=self.F(10))
+            elif i == n:
+                lb.configure(text=f"{i}  {t}", fg=C["acento"], font=self.F(10, "bold"))
+            else:
+                lb.configure(text=f"{i}  {t}", fg=C["fraco"], font=self.F(10))
 
     def _log(self, partes: list):
         self.log.configure(state="normal")
@@ -616,18 +699,24 @@ class Tela:
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
-        self.p_titulo.configure(text="Preparando os pacotes…", fg=C["texto"])
+        self.fase = "prep"
+        self._val_problemas = False
+        self._prog_i = self._prog_total = 0
+        self.n_val = {"ok": 0, "aviso": 0, "erro": 0}
+        self._etapa(1)
+        self.p_titulo.configure(text="Etapa 1 de 2  ·  Convertendo EXE em MSI", fg=C["texto"])
         self.p_atual.configure(text="Verificando e convertendo instaladores .exe em .msi")
-        self.p_detalhe.configure(text="Só leva tempo quando há .exe novos nas pastas.")
+        self._det_base = "Só leva tempo quando há .exe novos nas pastas."
+        self.p_detalhe.configure(text=self._det_base)
         for w in (self.p_oks, self.p_falhas, self.p_cont):
             w.configure(text="")
         self.barra.set(0, C["acento"])
-        for b in (self.b_logs, self.b_cancelar, self.b_fechar, self.b_voltar, self.b_refazer):
+        for b in (self.b_logs, self.b_cancelar, self.b_fechar, self.b_voltar, self.b_refazer, self.b_continuar):
             b.pack_forget()
         self.b_logs.pack(side="left")
         self.v_sel.pack_forget()
         self.v_prog.pack(fill="both", expand=True)
-        self._subtitulo("Preparando — aguarde, a seleção abre em seguida")
+        self._subtitulo("Preparando — nada é instalado antes de converter e validar tudo")
         cb = lambda ev, **kw: self.fila.put((ev, kw))   # noqa: E731
 
         def trabalho():
@@ -645,14 +734,88 @@ class Tela:
         self._log([(f"{self._hora()}  ", "hora"), (str(msg), tag)])
 
     def _ev_prep_item(self, i, total, nome, **_):
+        self._prog_i, self._prog_total = i, total
         self.p_atual.configure(text=nome)
-        self.p_detalhe.configure(text=f"Convertendo .exe em .msi   ·   {i} de {total}")
+        self._det_base = f"Convertendo .exe em .msi   ·   {i} de {total}"
+        self.p_detalhe.configure(text=self._det_base)
         self.barra.set((i - 1) / max(total, 1), C["acento"])
         self.p_cont.configure(text=f"{i} de {total}")
 
+    def _ev_etapa(self, numero, titulo, total=0, **_):
+        self._etapa(numero)
+        if numero == 2:
+            self.p_titulo.configure(text="Etapa 2 de 2  ·  Validando os pacotes", fg=C["texto"])
+            self.p_atual.configure(text="Conferindo cada pacote antes de instalar")
+            self._det_base = f"{total} pacote(s) para validar"
+            self.p_detalhe.configure(text=self._det_base)
+            self.barra.set(0, C["acento"])
+            self.p_oks.configure(text="")
+            self.p_falhas.configure(text="")
+            self.p_cont.configure(text=f"0 de {total}")
+            self._log([("", "info")])
+            self._log([("━━ VALIDAÇÃO ━━ nenhum pacote é instalado antes de passar por aqui", "nome")])
+
+    def _ev_val_item(self, i, total, nome, **_):
+        self._prog_i, self._prog_total = i, total
+        self.p_atual.configure(text=nome)
+        self._det_base = f"Validando pacote   ·   {i} de {total}"
+        self.p_detalhe.configure(text=self._det_base)
+        self.barra.set((i - 1) / max(total, 1), C["acento"])
+        self.p_cont.configure(text=f"{i} de {total}")
+
+    def _ev_prog(self, frac, texto="", **_):
+        if self.fase != "prep":
+            return
+        self.p_detalhe.configure(text=f"{self._det_base}   ·   {texto} {int(frac * 100)}%")
+        if self._prog_total:
+            cor = C["acento"] if not self.n_val.get("erro") else C["aviso"]
+            self.barra.set(min((self._prog_i - 1 + frac) / self._prog_total, 1.0), cor)
+
+    def _ev_val_resultado(self, i, total, nome, nivel, resumo, problemas=(), tardio=False, **_):
+        marca, tag = {"ok": ("✓", "ok"), "aviso": ("⚠", "aviso"), "erro": ("✕", "erro")}[nivel]
+        if not tardio:
+            self.n_val[nivel] = self.n_val.get(nivel, 0) + 1
+            txt = "íntegro" if nivel == "ok" else resumo
+            self._log([(f"{self._hora()}  ", "hora"), (f"{marca} ", tag), (nome, "nome"), (f"   {txt}", tag)])
+            self.p_oks.configure(text=f"{self.n_val['ok']} OK")
+            falt = self.n_val["erro"]
+            self.p_falhas.configure(text=f"{falt} bloqueado(s)" if falt else "")
+            extra = f"   ·   {self.n_val['aviso']} aviso(s)" if self.n_val["aviso"] else ""
+            self.p_cont.configure(text=f"{i} de {total}{extra}")
+            cor = C["acento"] if not falt else C["aviso"]
+            self.barra.set(i / max(total, 1), cor)
+        if tardio:      # aviso que só apareceu ao comparar com os outros pacotes: diz de quem é
+            self._log([(f"{self._hora()}  ", "hora"), ("⚠ ", "aviso"), (nome, "nome"), ("   conflito com outro pacote", "aviso")])
+        for niv, nm, det in problemas:
+            self._log([("            · ", "hora"), (f"{nm}: {det}", "erro" if niv == "erro" else "aviso")])
+
+    def _ev_val_fim(self, ok, avisos, erros, sem_msi=0, total=0, **_):
+        self._val_problemas = bool(erros or avisos or sem_msi)
+        self.p_oks.configure(text=f"{ok} OK")
+        self.p_falhas.configure(text=f"{erros} bloqueado(s)" if erros else "")
+        if erros:
+            self.p_titulo.configure(text=f"Validação concluída: {erros} pacote(s) BLOQUEADO(S)", fg=C["erro"])
+            self.p_atual.configure(text="Pacotes bloqueados não serão instalados. Detalhes no log abaixo.")
+            self.barra.set(1.0, C["erro"])
+        elif avisos or sem_msi:
+            self.p_titulo.configure(text="Validação concluída com avisos", fg=C["aviso"])
+            self.p_atual.configure(text=f"{ok} OK · {avisos} com aviso" + (f" · {sem_msi} .exe sem .msi" if sem_msi else ""))
+            self.barra.set(1.0, C["aviso"])
+        else:
+            self.p_titulo.configure(text=f"Todos os {total} pacote(s) validados", fg=C["ok"])
+            self.p_atual.configure(text="Nenhum problema encontrado. Abrindo a seleção…")
+            self.barra.set(1.0, C["ok"])
+        self.p_detalhe.configure(text="O relatório completo fica em logs\\validacao_*.txt")
+        self._log([("", "info")])
+        self._log([(f"Resumo: {ok} OK · {avisos} com aviso · {erros} bloqueado(s)", "ok" if not (erros or avisos) else "aviso")])
+
     def _ev_preparado(self, **_):
         self.rodando = False
-        self.mostrar_selecao()
+        if self._val_problemas:
+            self._subtitulo("Confira o resultado da validação e continue")
+            self.b_continuar.pack(side="right")
+        else:
+            self.root.after(1400, self.mostrar_selecao)
 
     # ------------------------------------------------------------ instalação
     def instalar_selecionados(self):
@@ -681,6 +844,8 @@ class Tela:
     def _iniciar(self, itens):
         self.resultados = []
         self.rodando = True
+        self.fase = "inst"
+        self._etapa(3)
         self.cancelar = threading.Event()
         self.fila = queue.Queue()
         self.total = sum(len(m) for _, m in itens)
@@ -695,7 +860,7 @@ class Tela:
         self.p_falhas.configure(text="")
         self.p_cont.configure(text=f"0 de {self.total}")
         self.barra.set(0, C["acento"])
-        for b in (self.b_logs, self.b_cancelar, self.b_fechar, self.b_voltar, self.b_refazer):
+        for b in (self.b_logs, self.b_cancelar, self.b_fechar, self.b_voltar, self.b_refazer, self.b_continuar):
             b.pack_forget()
         self.b_cancelar.configurar("Cancelar após o item atual", True)
         self.b_cancelar.pack(side="right")
@@ -738,7 +903,8 @@ class Tela:
 
     def _ev_item(self, i, total, pasta, msi, modo, **_):
         self.p_atual.configure(text=msi.stem)
-        modo_txt = "instalador embutido (modo direto)" if modo == "direto" else "msiexec"
+        modo_txt = {"direto": "instalador embutido (modo direto)",
+                    "bloqueado": "bloqueado pela validação"}.get(modo, "msiexec")
         self.p_detalhe.configure(text=f"{pasta.name}   ·   {modo_txt}   ·   item {i} de {total}")
         self._log([(f"{self._hora()}  ", "hora"), ("▶ ", "info"), (f"{pasta.name} › {msi.name}", "nome")])
 
@@ -776,6 +942,8 @@ class Tela:
             self._log([("Reinicie o computador para concluir algumas instalações.", "aviso")])
 
     def _ev_erro(self, msg, **_):
+        if self.fase == "prep":
+            self._val_problemas = True        # não avança sozinho: o técnico precisa ler o erro
         self._log([(f"{self._hora()}  ERRO: {msg}", "erro")])
 
     def _ev_terminou(self, **_):

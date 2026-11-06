@@ -404,6 +404,46 @@ cmd.exe /c ""C:\Caminho\Raiz\INSTALAR.bat" --sem-pausa > "C:\Caminho\Raiz\#SISTE
 
 ---
 
+## ✅ Validação dos pacotes (v2.2)
+
+O fluxo agora tem **três etapas visíveis** (indicador no topo da tela): **① Conversão › ② Validação › ③ Instalação**.
+
+1. **Prompt de comando visível** – o `INICIAR.bat` mostra `[1/3] administrador`, `[2/3] Python` e `[3/3] iniciando`. Se o Python não estiver instalado, `instalar_python.ps1` instala com cronômetro e a etapa atual do instalador ao vivo; quando termina, a tela abre e a janela fecha sozinha.
+2. **Conversão na tela** – cada `.exe` convertido é conferido contra o original (tamanho + SHA-256) antes de o `.exe` ser apagado. Qualquer dúvida (erro **ou** aviso) mantém o `.exe`.
+3. **Validação de TODOS os `.msi`** – um por um, com resultado ao vivo. Nada é instalado antes de terminar.
+4. **Seleção** – cada pacote mostra `✓ VÁLIDO`, `⚠ AVISO` ou `✕ BLOQUEADO` com o **motivo**. Bloqueados não têm caixa de seleção; os válidos já vêm marcados (`PRESELECIONAR_VALIDOS`).
+5. **Instalação** – confere de novo na hora (se o arquivo mudou desde a validação) e **nunca executa um pacote reprovado** (registrado como código 1620 + motivo).
+
+### O que é conferido
+
+| Conferência | Reprova (ERRO) quando… |
+|---|---|
+| Arquivo | vazio, ilegível ou sem cabeçalho de MSI (cópia interrompida) |
+| Banco MSI | o Windows Installer não consegue abrir (arquivo corrompido/truncado) |
+| Tabelas | faltam Property, InstallExecuteSequence (e, nos MSI gerados aqui, Component/Feature/FeatureComponents/Directory/Binary/CustomAction) |
+| Identidade | ProductCode ausente/inválido, ProductVersion ausente |
+| Componentes | nenhum Component ou Feature sem componentes (**causa do erro 1603**), referências quebradas, componente 64 bits em Windows 32 bits |
+| Sequência | InstallInitialize/InstallFinalize ausentes ou fora de ordem |
+| Fontes (.cab) | `.cab` externo não está ao lado do `.msi`; `.cab` embutido ausente ou truncado |
+| Payload (MSI gerados aqui) | `.exe` embutido vazio, sem cabeçalho PE, **SHA-256 diferente** do gravado na conversão/do `.exe` original, tamanho divergente |
+| Custom Action | `RunInstall` ausente, sem argumentos silenciosos ou fora da transação |
+| Entre pacotes | (AVISO) mesmo ProductCode ou mesmo UpgradeCode com versões diferentes – o 2º seria ignorado com código 1638, que conta como "sucesso" |
+
+Em **pacotes de terceiros**, inconsistências de catálogo viram **AVISO** (não bloqueiam); só há bloqueio com evidência de que vai falhar. Falha do próprio validador também vira AVISO – nunca bloqueia por engano.
+
+### Parâmetros e configurações
+
+| Parâmetro | Efeito |
+|---|---|
+| `--validacao-rapida` | só estrutura e tamanhos (não lê cada instalador por inteiro) |
+| `--sem-validar` | pula a validação (não recomendado) |
+| `--ignorar-bloqueio` | valida e mostra o relatório, mas instala mesmo os reprovados (emergência) |
+
+Constantes em `instalador_msi.py`: `VALIDAR`, `VALIDACAO_COMPLETA`, `BLOQUEAR_INVALIDOS`, `PRESELECIONAR_VALIDOS`. Relatório completo em `logs\validacao_*.txt` e seção "Validação dos pacotes" no `status.txt`.
+
+**Tempo:** a validação completa lê cada `.msi` uma vez; em pen drive, é proporcional ao tamanho total dos instaladores.
+**Limitações:** arquivos soltos de MSI não comprimido não são verificados um a um; condições de lançamento (LaunchCondition) não são avaliadas; MSI gerados por versões anteriores não têm hash gravado (confere-se tamanho e estrutura PE).
+
 ## 🔄 Conversão EXE → MSI (v1.3)
 
 A cada execução, **antes de instalar**, o programa varre as pastas de instaladores (nunca a `#SISTEMA` nem pastas `#`/`.`), converte cada `.exe` em um `.msi` de mesmo nome na mesma pasta, **verifica** o resultado e então **apaga o `.exe`**. Em seguida instala tudo, inclusive os MSI novos.

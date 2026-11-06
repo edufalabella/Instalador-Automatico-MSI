@@ -34,12 +34,13 @@ from typing import Optional
 from xml.sax.saxutils import quoteattr
 
 import exec_silencioso as ex   # execução oculta, árvore de processos, watchdog (mesma pasta)
+import validacao_msi as val    # validação rigorosa dos pacotes MSI (mesma pasta)
 
 # ----------------------------------------------------------------------------
 # Configurações
 # ----------------------------------------------------------------------------
 TITULO = "INSTALADOR AUTOMÁTICO MSI"
-VERSAO = "2.1"
+VERSAO = "2.2"
 DESENVOLVEDOR = "Eduardo Falabella"
 PASTAS_IGNORADAS = {"logs", "__pycache__", "build", "dist"}
 BUSCA_RECURSIVA = True          # procura .msi também dentro de subpastas
@@ -64,6 +65,13 @@ POS_MAX_S = 600                 # teto de espera pelos processos filhos
 ESPERA_MSI_LIVRE_S = 900        # espera máxima pelo Windows Installer ficar livre entre pacotes
 VERIFICAR_HASH_ATE_MB = 300     # na conversão, confere SHA-256 do .exe dentro do MSI até este tamanho
 LIMITE_BINARY_BYTES = 2_000_000_000   # limite prático de um stream na tabela Binary do MSI
+
+# --- validação dos pacotes (v2.2) ---
+VALIDAR = True                  # valida TODOS os .msi depois da conversão e antes de instalar
+VALIDACAO_COMPLETA = True       # True = lê cada .exe/.cab embutido por inteiro (SHA-256); False = só estrutura
+BLOQUEAR_INVALIDOS = True       # pacote com ERRO na validação NÃO é instalado
+PRESELECIONAR_VALIDOS = True    # na tela de seleção, já deixa marcados os pacotes que passaram na validação
+CODIGO_BLOQUEADO = 1620         # código registrado para pacote bloqueado (ERROR_INSTALL_PACKAGE_INVALID)
 
 CONVERTER_EXE = True            # procura .exe nas pastas e converte para .msi antes de instalar
 EXCLUIR_EXE_APOS_CONVERTER = True   # apaga o .exe SÓ depois que o MSI foi gerado e verificado
@@ -311,7 +319,7 @@ def descobrir_diretorios() -> list[tuple[Path, list[Path]]]:
 # Status ao vivo (logs\status.txt)
 # ----------------------------------------------------------------------------
 ESTADO = {"estado": "AGUARDANDO", "inicio": None, "total": 0, "atual": 0,
-          "pacote": "", "acao": "", "tipo": "", "resultados": [], "conversoes": []}
+          "pacote": "", "acao": "", "tipo": "", "resultados": [], "conversoes": [], "validacoes": []}
 
 
 def ts() -> str:
@@ -339,6 +347,9 @@ def gravar_status() -> None:
             "Concluídos:",
         ]
         linhas += [f"  [{c:>5}] {n} -> {st}" for n, c, st in e["resultados"]]
+        if e.get("validacoes"):
+            linhas += ["", "Validação dos pacotes:"]
+            linhas += [f"  [{n_.upper():>5}] {nome} -> {resumo}" for nome, n_, resumo in e["validacoes"]]
         if e["conversoes"]:
             linhas += ["", "Conversões EXE -> MSI:"]
             linhas += [f"  [{st}] {n} {det}" for n, st, det in e["conversoes"]]
@@ -372,11 +383,13 @@ _CB_BATIMENTO = None   # callable(seg, etapa) - usado pela tela gráfica para mo
 _CB_EVENTO = None      # callable(evento, **dados) - tela gráfica (instalação e preparação)
 
 
-def evento(nome: str, **dados) -> None:
-    """Envia um evento para a tela gráfica (se houver). Nunca levanta exceção."""
+def evento(tipo: str, /, **dados) -> None:
+    """Envia um evento para a tela gráfica (se houver). Nunca levanta exceção.
+    'tipo' é só-posicional: assim os dados podem ter uma chave chamada 'nome' (antes isso dava
+    TypeError e derrubava a conversão na tela gráfica)."""
     if _CB_EVENTO:
         with contextlib.suppress(Exception):
-            _CB_EVENTO(nome, **dados)
+            _CB_EVENTO(tipo, **dados)
 
 
 def aviso(msg: str, nivel: str = "info") -> None:
@@ -774,8 +787,14 @@ def instalar_lista(itens: list[tuple[Path, list[Path]]], callback=None, cancelar
                 break
             nome_log = f"{pasta.name}_{msi.stem}_{carimbo}.log".replace(" ", "_")
             log_file = LOG_DIR / nome_log
-            embutido = direto and pacote_embutido(msi)
-            modo = "direto" if embutido else "msiexec"
+            bloqueio = ""
+            if VALIDAR and BLOQUEAR_INVALIDOS:
+                # confere de novo na hora (usa o resultado da etapa de validação se o arquivo não mudou)
+                rv = validar_msi(msi, progresso=_progresso("instalação"))
+                if rv.nivel == "erro":
+                    bloqueio = rv.resumo
+            embutido = direto and not bloqueio and pacote_embutido(msi)
+            modo = "bloqueado" if bloqueio else ("direto" if embutido else "msiexec")
             print(f"  {barra(i - 1, total)}")
             print(f"  {ts()}{CIANO}[{i}/{total}]{RESET} {pasta.name} {CINZA}›{RESET} {BRANCO}{msi.name}{RESET}"
                   f" {CINZA}[{modo}]{RESET}")
@@ -783,10 +802,15 @@ def instalar_lista(itens: list[tuple[Path, list[Path]]], callback=None, cancelar
             gravar_status()
             emit("item", i=i, total=total, pasta=pasta, msi=msi, modo=modo)
             t0 = time.time()
-            codigo = instalar_embutido(msi, log_file) if embutido else instalar_msi(msi, log_file)
+            if bloqueio:
+                codigo = CODIGO_BLOQUEADO
+                aviso(f"BLOQUEADO pela validação: {bloqueio}", "erro")
+            else:
+                codigo = instalar_embutido(msi, log_file) if embutido else instalar_msi(msi, log_file)
             dur = int(time.time() - t0)
             ok = codigo in CODIGOS_OK
-            status = CODIGOS_OK.get(codigo) or texto_falha(codigo, ESTADO.get("tipo", ""))
+            status = (f"BLOQUEADO pela validação ({bloqueio})" if bloqueio
+                      else CODIGOS_OK.get(codigo) or texto_falha(codigo, ESTADO.get("tipo", "")))
             cor, marca = (VERDE, " OK ") if ok else (VERMELHO, "ERRO")
             print(f"        {ts()}{cor}[{marca}] {status}{RESET} {CINZA}({dur}s){RESET}\n")
             resultados.append((f"{pasta.name}\\{msi.name}", codigo, status))
@@ -845,6 +869,8 @@ WXS3 = """<?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Product Id="*" Name={nome} Language="1033" Version={versao}
            Manufacturer="Instalador Automatico" UpgradeCode="{upgrade}">
+    <Property Id="ExeSha256" Value={sha256} />
+    <Property Id="ExeBytes" Value={bytes} />
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine"
              Description={nome} />
     <MajorUpgrade DowngradeErrorMessage="Ja existe uma versao mais nova instalada." />
@@ -978,7 +1004,8 @@ def construir_msi(exe: Path, msi: Path, args: str, wix: tuple, log_path: Path) -
             wxs.write_text(WXS3.format(
                 nome=quoteattr(exe.stem), versao=quoteattr(versao_exe(exe)),
                 upgrade=str(uuid.uuid5(NS_UPGRADE, exe.stem.lower())).upper(),
-                exe=quoteattr(str(exe.resolve())), args=quoteattr(args)), encoding="utf-8")
+                exe=quoteattr(str(exe.resolve())), args=quoteattr(args),
+                sha256=quoteattr(_sha256(exe)), bytes=quoteattr(str(exe.stat().st_size))), encoding="utf-8")
             if _rodar([str(candle), "-nologo", "-out", str(obj) + os.sep, str(wxs)], log) != 0:
                 return False, "candle falhou (veja o log)"
             saida = tmp / "pkg.msi"
@@ -1008,39 +1035,26 @@ def _sha256(arq: Path) -> str:
     return h.hexdigest()
 
 
+VALIDACOES: dict = {}           # Path do .msi -> val.Resultado (validado nesta execução)
+
+
+def validar_msi(msi: Path, exe: Optional[Path] = None, forcar: bool = False, progresso=None):
+    """Valida um .msi e guarda o resultado. Reaproveita o resultado se o arquivo não mudou
+    (mesmo tamanho e data) e a validação anterior já cobriu o mesmo nível de leitura."""
+    msi = Path(msi)
+    antigo = VALIDACOES.get(msi)
+    if (not forcar and antigo is not None and antigo.assinatura == val.assinatura_arquivo(msi)
+            and antigo.info.get("completa", False) >= VALIDACAO_COMPLETA):
+        return antigo
+    r = val.validar_pacote(msi, exe=exe, completo=VALIDACAO_COMPLETA, progresso=progresso)
+    r.info["completa"] = VALIDACAO_COMPLETA
+    VALIDACOES[msi] = r
+    return r
+
+
 def verificar_msi(msi: Path, exe: Path) -> bool:
-    """Só devolve True se TODAS as conferências passarem (e só então o .exe pode ser apagado):
-       1) arquivo OLE válido e maior que o .exe;  2) tabela Binary com 'SetupExe';
-       3) Component + FeatureComponents (sem isso o Windows Installer aborta com 1603);
-       4) o stream embutido tem EXATAMENTE o tamanho do .exe;
-       5) até VERIFICAR_HASH_ATE_MB: o SHA-256 do .exe extraído de dentro do MSI é idêntico ao original.
-    Tudo via msi.dll (sem PowerShell, sem janela)."""
-    try:
-        tam_exe = exe.stat().st_size
-        if not msi.is_file() or msi.stat().st_size < tam_exe:
-            return False
-        with open(msi, "rb") as f:
-            if f.read(8) != bytes.fromhex("D0CF11E0A1B11AE1"):  # cabeçalho OLE de um MSI
-                return False
-        sql_bin = "SELECT `Data` FROM `Binary` WHERE `Name`='SetupExe'"
-        if msi_texto(msi, "SELECT `Name` FROM `Binary` WHERE `Name`='SetupExe'") is None:
-            return False
-        if msi_texto(msi, "SELECT `Component` FROM `Component`") is None:
-            return False
-        if msi_texto(msi, "SELECT `Feature_` FROM `FeatureComponents`") is None:
-            return False
-        if msi_tamanho_stream(msi, sql_bin) != tam_exe:
-            return False
-        if tam_exe <= VERIFICAR_HASH_ATE_MB << 20:
-            with tempfile.TemporaryDirectory(prefix="verif_") as t:
-                copia = Path(t) / "extraido.bin"
-                if not msi_extrair_stream(msi, sql_bin, copia):
-                    return False
-                if _sha256(copia) != _sha256(exe):
-                    return False
-        return True
-    except Exception:  # noqa: BLE001
-        return False
+    """Atalho: True só se a validação completa (comparando com o .exe original) der OK, sem avisos."""
+    return validar_msi(msi, exe=exe, forcar=True).nivel == "ok"
 
 
 # ----------------------------------------------------------------------------
@@ -1202,8 +1216,9 @@ def reparar_msis_antigos(simular: bool = False) -> tuple:
                 ok, msg = construir_msi(exe, novo, args, wix, LOG_DIR / f"reparo_{msi.stem}_{carimbo}.log")
                 if not ok:
                     raise RuntimeError(msg)
-                if not verificar_msi(novo, exe):
-                    raise RuntimeError("MSI reconstruído não passou na verificação")
+                rv = val.validar_pacote(novo, exe=exe, completo=VALIDACAO_COMPLETA, progresso=_progresso("reparo"))
+                if rv.nivel != "ok":
+                    raise RuntimeError(f"MSI reconstruído não passou na validação ({rv.resumo})")
                 shutil.move(str(msi), str(backup))        # só troca depois de tudo verificado
                 try:
                     shutil.move(str(novo), str(msi))
@@ -1293,11 +1308,19 @@ def converter_exes(simular: bool = False, manter: bool = False) -> tuple:
             msi.unlink(missing_ok=True)
             registrar(nome, "FALHA", f"{msg}; .exe mantido (log em logs\\conv_{exe.stem}_{carimbo}.log)", VERMELHO)
             continue
-        if not verificar_msi(msi, exe):
+        ESTADO["acao"] = "validando o MSI gerado"
+        rv = validar_msi(msi, exe=exe, forcar=True, progresso=_progresso("conversão"))
+        if rv.nivel == "erro":
             pendencias += 1
-            registrar(nome, "FALHA", f"{msi.name} gerado mas NÃO passou na verificação; "
+            VALIDACOES.pop(msi, None)
+            registrar(nome, "FALHA", f"{msi.name} gerado mas REPROVADO na validação ({rv.resumo}); "
                       f"MSI removido e .exe mantido", VERMELHO)
             msi.unlink(missing_ok=True)
+            continue
+        if rv.nivel == "aviso":
+            pendencias += 1
+            registrar(nome, "AVISO", f"{msi.name} criado com aviso na validação ({rv.resumo}); "
+                      f".exe mantido por segurança", AMARELO)
             continue
 
         if not conhecido:
@@ -1317,6 +1340,121 @@ def converter_exes(simular: bool = False, manter: bool = False) -> tuple:
     ESTADO.update(estado="CONVERSÃO CONCLUÍDA", pacote="", acao="")
     gravar_status()
     return len(exes), pendencias
+
+
+# ----------------------------------------------------------------------------
+# Etapa de VALIDAÇÃO (depois da conversão, antes da instalação)
+# ----------------------------------------------------------------------------
+def _progresso(origem: str = ""):
+    """Callback (fração, texto) para a validação: limita a ~7 eventos/s para não inundar a tela."""
+    ultimo = [0.0]
+
+    def cb(frac: float, texto: str) -> None:
+        agora = time.time()
+        if frac < 1.0 and agora - ultimo[0] < 0.15:
+            return
+        ultimo[0] = agora
+        evento("prog", frac=frac, texto=texto)
+    return cb
+
+
+def status_validacao(msi: Path):
+    """(nivel, resumo) do último resultado deste .msi, ou None se ainda não foi validado."""
+    r = VALIDACOES.get(Path(msi))
+    return (r.nivel, r.resumo) if r is not None else None
+
+
+def exes_sem_msi() -> list:
+    """.exe que continuam sem .msi ao lado (conversão falhou/foi pulada) e, portanto, NÃO serão instalados."""
+    achados = []
+    for pasta in pastas_validas():
+        for exe in listar_exe(pasta):
+            if exe.with_suffix(".msi").exists():
+                continue
+            try:
+                if argumentos_do_exe(exe)[0] == "IGNORAR":
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+            achados.append((pasta, exe))
+    return achados
+
+
+def validar_todos(simular: bool = False) -> tuple:
+    """Valida TODOS os .msi de todas as pastas (um por um, com progresso), confere colisões entre eles,
+    grava logs\\validacao_*.txt e atualiza VALIDACOES/status. Devolve (ok, avisos, erros)."""
+    pacotes = [(pasta, msi) for pasta, msis in descobrir_diretorios() for msi in msis]
+    if not pacotes:
+        print(f"  {ts()}{CINZA}Nenhum .msi para validar.{RESET}")
+        return 0, 0, 0
+    total = len(pacotes)
+    modo = "completa (lê cada instalador por inteiro)" if VALIDACAO_COMPLETA else "rápida (estrutura e tamanhos)"
+    print(f"  {ts()}{BOLD}Validando {total} pacote(s) MSI - validação {modo}{RESET}\n")
+    ESTADO.update(estado="VALIDANDO PACOTES", inicio=datetime.now(), total=total, atual=0, pacote="", acao="")
+    ESTADO["validacoes"] = []
+    evento("etapa", numero=2, titulo="Validando os pacotes", total=total)
+    resultados = []
+    cores = {"ok": (VERDE, " OK "), "aviso": (AMARELO, "AVISO"), "erro": (VERMELHO, "ERRO")}
+
+    def mostrar(i: int, nome: str, r, a_partir: int = 0) -> None:
+        """Escreve no console e na tela o veredito (e só os itens com problema) a partir da verificação N."""
+        problemas = [v for v in r.verificacoes[a_partir:] if v.nivel in ("aviso", "erro")]
+        if a_partir == 0:
+            cor, marca = cores[r.nivel]
+            print(f"        {ts()}{cor}[{marca}] {r.resumo}{RESET} {CINZA}({r.duracao:.0f}s){RESET}", flush=True)
+        else:
+            print(f"        {ts()}{AMARELO}[AVISO] {nome}: conflito com outro pacote{RESET}", flush=True)
+        for v in problemas:
+            c = VERMELHO if v.nivel == "erro" else AMARELO
+            print(f"              {c}- {v.nome}: {v.detalhe}{RESET}", flush=True)
+        evento("val_resultado", i=i, total=total, nome=nome, nivel=r.nivel, resumo=r.resumo, tardio=a_partir > 0,
+               problemas=[(v.nivel, v.nome, v.detalhe) for v in problemas])
+
+    for i, (pasta, msi) in enumerate(pacotes, start=1):
+        nome = f"{pasta.name}\\{msi.relative_to(pasta)}"
+        tam = msi.stat().st_size // 1048576 if msi.exists() else 0
+        print(f"  {ts()}{CIANO}[{i}/{total}]{RESET} {nome} {CINZA}({tam} MB){RESET}", flush=True)
+        ESTADO.update(atual=i, pacote=nome, acao="validando")
+        gravar_status()
+        evento("val_item", i=i, total=total, nome=nome)
+        r = validar_msi(msi, progresso=_progresso("validação"))
+        val.limpar_lote(r)
+        resultados.append((i, nome, r, len(r.verificacoes)))
+        mostrar(i, nome, r)
+    val.checar_lote([r for _, _, r, _ in resultados])    # colisões entre pacotes (ProductCode / UpgradeCode)
+    for i, nome, r, n_antes in resultados:
+        if len(r.verificacoes) > n_antes:                 # ganhou aviso de colisão com outro pacote
+            mostrar(i, nome, r, a_partir=n_antes)
+
+    ok = avisos = erros = 0
+    carimbo = datetime.now().strftime("%Y%m%d_%H%M%S")
+    relatorio = [f"Validação em {datetime.now():%d/%m/%Y %H:%M:%S} - validador {val.VERSAO_VALIDADOR} - "
+                 f"modo {'completo' if VALIDACAO_COMPLETA else 'rápido'}", ""]
+    for i, nome, r, _ in resultados:
+        _, marca = cores[r.nivel]
+        ok, avisos, erros = ok + (r.nivel == "ok"), avisos + (r.nivel == "aviso"), erros + (r.nivel == "erro")
+        ESTADO["validacoes"].append((nome, r.nivel, r.resumo))
+        relatorio += [f"[{marca}] {nome}  ({r.tamanho / 1048576:.1f} MB, {r.duracao:.1f}s)"]
+        relatorio += ["      " + l for l in r.linhas()] + [""]
+    pendentes = exes_sem_msi()
+    for pasta, exe in pendentes:
+        txt = f"{pasta.name}\\{exe.name}: .exe SEM .msi - não será instalado (veja a conversão)"
+        print(f"        {ts()}{AMARELO}[AVISO] {txt}{RESET}")
+        relatorio.append(f"[AVISO] {txt}")
+        evento("aviso", msg=txt, nivel="aviso")
+    resumo = (f"RESUMO DA VALIDAÇÃO: {ok} OK | {avisos} com aviso | {erros} BLOQUEADO(S)"
+              f"{f' | {len(pendentes)} .exe sem .msi' if pendentes else ''} | total {total}")
+    print(f"\n  {BOLD}{resumo}{RESET}\n")
+    relatorio += ["", resumo]
+    try:
+        LOG_DIR.mkdir(exist_ok=True)
+        (LOG_DIR / f"validacao_{carimbo}.txt").write_text("\n".join(relatorio) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    ESTADO.update(estado="VALIDAÇÃO CONCLUÍDA", pacote="", acao="")
+    gravar_status()
+    evento("val_fim", ok=ok, avisos=avisos, erros=erros, sem_msi=len(pendentes), total=total)
+    return ok, avisos, erros
 
 
 # ----------------------------------------------------------------------------
@@ -1448,15 +1586,22 @@ def menu() -> None:
         pausar()
 
 
-def preparar_pacotes(cb=None, manter: bool = False) -> tuple:
-    """Repara MSIs antigos e converte .exe -> .msi. 'cb' recebe eventos da tela gráfica.
+def preparar_pacotes(cb=None, manter: bool = False, converter: bool = True) -> tuple:
+    """Repara MSIs antigos, converte .exe -> .msi e VALIDA todos os .msi. 'cb' recebe eventos da tela gráfica.
     Devolve (reparados, exes_encontrados, pendencias)."""
     global _CB_EVENTO
     _CB_EVENTO = cb
     try:
-        reparados, pend_reparo = reparar_msis_antigos()
-        encontrados, pend_conv = converter_exes(manter=manter)
-        return reparados, encontrados, pend_reparo + pend_conv
+        reparados = encontrados = pend_reparo = pend_conv = 0
+        if converter:
+            evento("etapa", numero=1, titulo="Convertendo EXE em MSI", total=0)
+            reparados, pend_reparo = reparar_msis_antigos()
+            encontrados, pend_conv = converter_exes(manter=manter)
+        pend_val = 0
+        if VALIDAR:
+            _, avisos, erros = validar_todos()
+            pend_val = avisos + erros
+        return reparados, encontrados, pend_reparo + pend_conv + pend_val
     finally:
         _CB_EVENTO = None
 
@@ -1486,7 +1631,8 @@ def abrir_interface(preparar=None) -> bool:
             "titulo": "Instalador Automático MSI", "versao": VERSAO, "desenvolvedor": DESENVOLVEDOR,
             "admin": eh_admin(), "obter_dirs": descobrir_diretorios,
             "classificar": classificar_pacote, "instalar": instalar, "abrir_logs": abrir_logs,
-            "preparar": preparar,
+            "preparar": preparar, "status_validacao": status_validacao,
+            "preselecionar": PRESELECIONAR_VALIDOS and VALIDAR,
         })
     except Exception as exc:  # noqa: BLE001
         GUI_ATIVA = False
@@ -1528,6 +1674,8 @@ def modo_automatico(args: argparse.Namespace) -> int:
     if not dirs:
         print("Nenhuma pasta com arquivos .msi encontrada.")
         return 4
+    if VALIDAR:
+        validar_todos()          # relatório completo; pacotes com ERRO são bloqueados na instalação
     selecionados = selecionar_pastas(dirs, args.pastas)
     if selecionados is None:
         return 2
@@ -1551,6 +1699,12 @@ def ler_argumentos() -> argparse.Namespace:
                     help="não converte .exe em .msi (só instala os .msi existentes)")
     ap.add_argument("--manter-exe", action="store_true",
                     help="converte, mas NÃO apaga os .exe originais")
+    ap.add_argument("--sem-validar", action="store_true",
+                    help="não valida os pacotes antes de instalar (não recomendado)")
+    ap.add_argument("--validacao-rapida", action="store_true",
+                    help="valida só estrutura e tamanhos (não lê cada instalador por inteiro / sem SHA-256)")
+    ap.add_argument("--ignorar-bloqueio", action="store_true",
+                    help="valida e mostra o relatório, mas instala mesmo os pacotes reprovados (emergência)")
     ap.add_argument("--console", action="store_true",
                     help="usa o menu de texto em vez da tela gráfica")
     ap.add_argument("--via-msiexec", action="store_true",
@@ -1605,7 +1759,14 @@ def _erro_fatal(exc: BaseException) -> None:
 
 def main() -> None:
     global AUTO, ANIMACAO, BASE, MODO_DIRETO, OCULTAR_JANELAS, VIGIAR_UI
+    global VALIDAR, VALIDACAO_COMPLETA, BLOQUEAR_INVALIDOS
     args = ler_argumentos()
+    if args.sem_validar:
+        VALIDAR = False
+    if args.validacao_rapida:
+        VALIDACAO_COMPLETA = False
+    if args.ignorar_bloqueio:
+        BLOQUEAR_INVALIDOS = False
     _garantir_streams()
     if args.via_msiexec:
         MODO_DIRETO = False
@@ -1637,18 +1798,20 @@ def main() -> None:
                 limpar_tela()
                 reparados, pend_reparo = reparar_msis_antigos()
                 encontrados, pend_conv = converter_exes(manter=args.manter_exe)
-                if pend_reparo or pend_conv or encontrados or reparados:
-                    pausar()
+            _, av_val, er_val = validar_todos() if VALIDAR else (0, 0, 0)
+            if usar_prep and (pend_reparo or pend_conv or encontrados or reparados) or av_val or er_val:
+                pausar()
             tela_apresentacao()
             menu()
         else:
-            prep = (lambda cb: preparar_pacotes(cb, args.manter_exe)) if usar_prep else None
+            prep = ((lambda cb: preparar_pacotes(cb, args.manter_exe, usar_prep))
+                    if (usar_prep or VALIDAR) else None)
             if not abrir_interface(prep):
                 if SEM_CONSOLE:
                     raise RuntimeError("Não foi possível abrir a tela gráfica (tkinter ausente?). "
                                        "Veja logs\\console.log ou use INSTALAR.bat --console.")
-                if usar_prep:
-                    preparar_pacotes(None, args.manter_exe)
+                if usar_prep or VALIDAR:
+                    preparar_pacotes(None, args.manter_exe, usar_prep)
                 tela_apresentacao()
                 menu()
     except KeyboardInterrupt:

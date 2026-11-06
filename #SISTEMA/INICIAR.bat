@@ -39,7 +39,7 @@ REM ---------------------------------------------------------------
 net session >nul 2>&1
 if %errorlevel% neq 0 (
     set "ESTILO=Normal"
-    if defined GUI set "ESTILO=Hidden"
+    REM o prompt de comando fica VISIVEL: ele mostra a instalacao do Python
     powershell -NoProfile -WindowStyle Hidden -Command "try { Start-Process -FilePath '%~f0' -ArgumentList '%*' -Verb RunAs -WindowStyle !ESTILO! -ErrorAction Stop } catch { exit 1 }"
     if errorlevel 1 call :falha "A permissao de administrador foi negada. O instalador precisa dela para funcionar."
     exit /b
@@ -49,50 +49,53 @@ REM Remove a marca de "arquivo baixado da internet" (evita avisos de seguranca e
 powershell -NoProfile -WindowStyle Hidden -Command "Get-ChildItem -LiteralPath '%~dp0' -Recurse -File -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue" >nul 2>&1
 
 REM ---------------------------------------------------------------
-REM 2) Procura o Python; se nao achar, instala a partir da pasta #SISTEMA
+REM 2) Procura o Python; se nao achar, instala a partir da pasta #SISTEMA (com progresso visivel)
 REM ---------------------------------------------------------------
+call :banner
+echo   [1/3] Permissao de administrador ...... OK
+echo   [2/3] Verificando o Python
 set "PY="
 call :achar_python
-if defined PY goto :rodar
+if defined PY goto :py_achado
 
-echo [INFO] Python nao encontrado neste computador.
+echo         Python nao encontrado neste computador.
 set "PYINST="
 for %%F in ("%~dp0python-*.exe") do set "PYINST=%%~fF"
 if not defined PYINST (
     call :falha "Instalador do Python nao encontrado. Coloque o arquivo python-3.x.x-amd64.exe dentro da pasta #SISTEMA."
     exit /b 1
 )
-
-echo [INFO] Instalando Python a partir de: %PYINST%
-echo        Aguarde, isso pode levar alguns minutos...
-set "TENT=0"
-:py_tentar
-set /a TENT+=1
-start "" /wait /min "%PYINST%" /quiet /norestart InstallAllUsers=1 PrependPath=1 Include_launcher=1 Include_tcltk=1 Include_test=0 Include_doc=0 /log "%~dp0logs\python_instalacao.log"
+echo         Instalador: %PYINST%
+echo         Instalando o Python. NAO feche esta janela.
+echo.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0instalar_python.ps1" -Instalador "%PYINST%" -Log "%~dp0logs\python_instalacao.log"
 set "RC=!errorlevel!"
-REM 1618 = outra instalacao em andamento (Windows Update etc.): espera 30 s e tenta de novo
-if "!RC!"=="1618" goto :py_espera
-if "!RC!"=="-2147023790" goto :py_espera
-goto :py_fim
-:py_espera
-if !TENT! lss 5 (
-    ping -n 31 127.0.0.1 >nul
-    goto :py_tentar
-)
-:py_fim
+echo.
 
 REM O PATH desta janela nao foi atualizado, entao procuramos o python.exe direto
 call :achar_python
 if not defined PY (
-    call :falha "O Python nao pode ser instalado ou localizado (codigo !RC!). Veja logs\python_instalacao.log."
+    call :falha "O Python nao pode ser instalado ou localizado, codigo !RC!. Veja logs\python_instalacao.log."
     exit /b 1
 )
-echo [OK] Python instalado com sucesso.
+echo         [OK] Python instalado com sucesso.
+goto :py_pronto
+
+:py_achado
+echo         [OK] Python ja instalado neste computador.
+
+:py_pronto
+set "PYVER="
+for /f "delims=" %%V in ('"%PY%" --version 2^>^&1') do set "PYVER=%%V"
+if defined PYVER echo         %PYVER%
+echo.
 
 REM ---------------------------------------------------------------
 REM 3) Executa o instalador de MSIs
 REM ---------------------------------------------------------------
 :rodar
+echo   [3/3] Iniciando a conversao e a validacao dos pacotes
+echo         A tela do instalador vai abrir; esta janela fecha sozinha.
 set "PYTHONUTF8=1"
 set "PYEXE="
 for /f "delims=" %%P in ('"%PY%" -c "import sys;print(sys.executable)"') do set "PYEXE=%%P"
@@ -106,6 +109,7 @@ if defined GUI (
     if not exist "!PYW!" set "GUI_OK="
     if defined GUI_OK ( "%PYEXE%" -c "import tkinter" >nul 2>&1 || set "GUI_OK=" )
     if defined GUI_OK (
+        ping -n 4 127.0.0.1 >nul
         start "" "!PYW!" "%~dp0instalador_msi.py" %*
         exit /b 0
     )
@@ -126,6 +130,20 @@ if %RC% equ 0 (
 )
 if defined AUTO if not defined NOPAUSE pause
 exit /b %RC%
+
+
+REM ===============================================================
+REM Sub-rotina: cabecalho do prompt de comando
+REM ===============================================================
+:banner
+cls
+echo.
+echo   ============================================================
+echo     INSTALADOR AUTOMATICO MSI
+echo     Python  ^>  Conversao EXE-MSI  ^>  Validacao  ^>  Instalacao
+echo   ============================================================
+echo.
+exit /b 0
 
 
 REM ===============================================================

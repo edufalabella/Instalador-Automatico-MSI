@@ -11,6 +11,9 @@ REM    INSTALAR.bat --sem-pausa          para tarefa agendada / GPO / SCCM
 REM    INSTALAR.bat --manter-exe         converte EXE sem apagar o original
 REM    INSTALAR.bat --console            usa o menu de texto em vez da tela grafica
 REM    INSTALAR.bat --via-msiexec        roda os MSI gerados via msiexec (padrao: .exe embutido direto)
+REM    INSTALAR.bat --validacao-rapida   valida so estrutura/tamanhos (nao le cada instalador por inteiro)
+REM    INSTALAR.bat --sem-validar        NAO valida os pacotes (nao recomendado)
+REM    INSTALAR.bat --ignorar-bloqueio   instala mesmo pacotes reprovados na validacao (emergencia)
 REM    INSTALAR.bat --ver-janelas        diagnostico: NAO oculta/encerra telas dos instaladores, so registra
 REM ===============================================================
 setlocal
