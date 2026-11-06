@@ -211,6 +211,14 @@ class Tela:
         else:
             self.mostrar_selecao()
         self.root.bind("<Control-a>", lambda e: self.marcar_todos(True))
+        if cfg.get("ao_abrir"):
+            self.root.after(300, self._avisar_aberta)
+
+    def _avisar_aberta(self):
+        try:
+            self.cfg["ao_abrir"]()
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------ infraestrutura
     @staticmethod

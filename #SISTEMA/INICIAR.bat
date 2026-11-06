@@ -130,24 +130,74 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-echo         A tela do instalador vai abrir; esta janela fecha sozinha.
+if not defined GUI goto :modo_texto
 
-if defined GUI (
-    REM tela grafica exige pythonw.exe + tkinter; sem eles cai no console (janela visivel)
-    set "GUI_OK=1"
-    if not exist "!PYW!" set "GUI_OK="
-    if defined GUI_OK ( "%PYEXE%" -c "import tkinter" >nul 2>&1 || set "GUI_OK=" )
-    if defined GUI_OK (
-        ping -n 4 127.0.0.1 >nul
-        >>"%~dp0logs\iniciar.log" echo [%date% %time%] abrindo a tela grafica
-        start "" "!PYW!" "%~dp0instalador_msi.py" %*
-        exit /b 0
-    )
-    echo [AVISO] Tela grafica indisponivel neste Python; abrindo o modo console.
-    start "Instalador MSI" /wait "%PYEXE%" "%~dp0instalador_msi.py" %* --console
-    exit /b !errorlevel!
+REM ---------------------------------------------------------------
+REM Tela grafica (pythonw.exe + tkinter). CORRECAO do "o prompt abre, fecha e nada acontece":
+REM antes o pythonw era disparado com START e esta janela fechava NA HORA, sem conferir nada.
+REM Se o pythonw morresse ao iniciar, ninguem via o erro. Agora esta janela so fecha depois que
+REM a tela grafica avisa que abriu (logs\tela_aberta.flag); se o pythonw morrer, o erro aparece aqui.
+REM ---------------------------------------------------------------
+if not exist "%PYW%" (
+    echo         [AVISO] pythonw.exe nao encontrado em "%PYW%" - usando o modo texto.
+    >>"%~dp0logs\iniciar.log" echo [%date% %time%] pythonw.exe ausente: "%PYW%"
+    goto :modo_console
+)
+"%PYEXE%" -c "import tkinter; tkinter.Tk().destroy()" >"%~dp0logs\tkinter.log" 2>&1
+if errorlevel 1 (
+    echo         [AVISO] O tkinter deste Python nao funciona - usando o modo texto.
+    type "%~dp0logs\tkinter.log"
+    >>"%~dp0logs\iniciar.log" echo [%date% %time%] tkinter falhou, ver logs\tkinter.log
+    goto :modo_console
 )
 
+echo         Abrindo a tela do instalador. Aguarde...
+set "IM_PYW=%PYW%"
+set "IM_SCRIPT=%~dp0instalador_msi.py"
+set "IM_ARGS=%*"
+set "IM_FLAG=%~dp0logs\tela_aberta.flag"
+del /q "%IM_FLAG%" >nul 2>&1
+>>"%~dp0logs\iniciar.log" echo [%date% %time%] abrindo a tela grafica: %PYW%
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$a = [char]34 + $env:IM_SCRIPT + [char]34 + ' ' + $env:IM_ARGS; try { $p = Start-Process -FilePath $env:IM_PYW -ArgumentList $a -PassThru -ErrorAction Stop } catch { Write-Host $_.Exception.Message; exit 4 }; for ($i = 0; $i -lt 90; $i++) { if (Test-Path -LiteralPath $env:IM_FLAG) { exit 0 }; if ($p.HasExited) { exit 2 }; Start-Sleep -Milliseconds 500 }; exit 3"
+set "GUIRC=%errorlevel%"
+>>"%~dp0logs\iniciar.log" echo [%date% %time%] resultado da abertura: %GUIRC% (0=abriu 2=morreu 3=sem janela 4=nao iniciou)
+if "%GUIRC%"=="0" exit /b 0
+
+echo.
+if "%GUIRC%"=="3" (
+    echo   [AVISO] O programa esta rodando, mas a janela nao apareceu em 45 segundos.
+    echo           Procure a janela na barra de tarefas. Se nao houver nenhuma, veja os logs abaixo.
+) else (
+    echo   [ERRO] A tela grafica fechou logo ao abrir, codigo %GUIRC%.
+)
+echo.
+echo   ---- ultimas linhas de logs\console.log ----
+powershell -NoProfile -Command "if (Test-Path -LiteralPath $env:IM_FLAG.Replace('tela_aberta.flag','console.log')) { Get-Content -LiteralPath $env:IM_FLAG.Replace('tela_aberta.flag','console.log') -Tail 25 }"
+if exist "%~dp0logs\erro_fatal.txt" (
+    echo   ---- logs\erro_fatal.txt ----
+    powershell -NoProfile -Command "Get-Content -LiteralPath $env:IM_FLAG.Replace('tela_aberta.flag','erro_fatal.txt') -Tail 25"
+)
+if exist "%~dp0logs\falha_nativa.txt" (
+    echo   ---- logs\falha_nativa.txt ----
+    powershell -NoProfile -Command "Get-Content -LiteralPath $env:IM_FLAG.Replace('tela_aberta.flag','falha_nativa.txt') -Tail 25"
+)
+echo.
+if "%GUIRC%"=="3" (
+    pause
+    exit /b 0
+)
+echo   Envie a pasta logs para o suporte. Agora o instalador vai abrir no MODO TEXTO nesta janela.
+pause
+
+:modo_console
+"%PYEXE%" "%~dp0instalador_msi.py" %* --console
+set "RC=%errorlevel%"
+echo.
+echo [FIM] Modo texto encerrado, codigo %RC%.
+pause
+exit /b %RC%
+
+:modo_texto
 "%PYEXE%" "%~dp0instalador_msi.py" %*
 set "RC=%errorlevel%"
 echo.

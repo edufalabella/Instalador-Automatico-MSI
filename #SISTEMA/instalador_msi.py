@@ -1627,6 +1627,14 @@ def preparar_pacotes(cb=None, manter: bool = False, converter: bool = True) -> t
         _CB_EVENTO = None
 
 
+def _marcar_tela_aberta() -> None:
+    """Avisa o INICIAR.bat que a janela apareceu de fato (ele espera por este arquivo)."""
+    with contextlib.suppress(Exception):
+        LOG_DIR.mkdir(exist_ok=True)
+        (LOG_DIR / "tela_aberta.flag").write_text(f"{os.getpid()}\n", encoding="utf-8")
+    print(f"  {datetime.now():%H:%M:%S} Tela gráfica aberta.", flush=True)
+
+
 def abrir_interface(preparar=None) -> bool:
     """Abre a tela gráfica. 'preparar(callback)' (opcional) roda ANTES da seleção, dentro da própria tela
     (conversão/reparo de .exe -> .msi), para o técnico ver só ela. False = não foi possível abrir."""
@@ -1654,6 +1662,7 @@ def abrir_interface(preparar=None) -> bool:
             "classificar": classificar_pacote, "instalar": instalar, "abrir_logs": abrir_logs,
             "preparar": preparar, "status_validacao": status_validacao,
             "preselecionar": PRESELECIONAR_VALIDOS and VALIDAR,
+            "ao_abrir": _marcar_tela_aberta,
         })
     except Exception as exc:  # noqa: BLE001
         GUI_ATIVA = False
@@ -1812,14 +1821,20 @@ def _erro_fatal(exc: BaseException) -> None:
 def main() -> None:
     global AUTO, ANIMACAO, BASE, MODO_DIRETO, OCULTAR_JANELAS, VIGIAR_UI
     global VALIDAR, VALIDACAO_COMPLETA, BLOQUEAR_INVALIDOS
-    args = ler_argumentos()
+    _garantir_streams()          # PRIMEIRO: com pythonw, qualquer erro antes disto sumia sem rastro
+    print(f"  {datetime.now():%d/%m/%Y %H:%M:%S} Iniciando ({Path(sys.executable).name}) argumentos: "
+          f"{' '.join(sys.argv[1:]) or '-'}", flush=True)
+    try:
+        args = ler_argumentos()
+    except SystemExit:
+        print("  [ERRO] Argumentos inválidos na linha de comando (veja acima).", flush=True)
+        raise
     if args.sem_validar:
         VALIDAR = False
     if args.validacao_rapida:
         VALIDACAO_COMPLETA = False
     if args.ignorar_bloqueio:
         BLOQUEAR_INVALIDOS = False
-    _garantir_streams()
     if args.via_msiexec:
         MODO_DIRETO = False
     if args.ver_janelas:
@@ -1877,4 +1892,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException as _exc:  # noqa: BLE001 - erro na partida: registra e mostra (com pythonw seria invisível)
+        _erro_fatal(_exc)
+        sys.exit(3)
