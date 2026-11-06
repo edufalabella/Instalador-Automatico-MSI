@@ -685,6 +685,8 @@ class Tela:
                 "Sair agora pode deixá-la incompleta.\n\nDeseja sair mesmo assim?"):
             return
         self.cancelar.set()
+        print(f"  {datetime.now():%H:%M:%S} Tela fechada pelo usuário"
+              f"{' DURANTE uma operação (conversão/instalação interrompida)' if self.rodando else ''}.", flush=True)
         self.root.destroy()
 
     def _cancelar(self):
@@ -720,11 +722,16 @@ class Tela:
         cb = lambda ev, **kw: self.fila.put((ev, kw))   # noqa: E731
 
         def trabalho():
+            # BaseException: qualquer falha (até SystemExit/KeyboardInterrupt dentro da thread) aparece na
+            # tela e libera os botões; antes a thread podia morrer calada e a tela ficava parada para sempre.
             try:
                 self.cfg["preparar"](cb)
-            except Exception as exc:  # noqa: BLE001
-                self.fila.put(("erro", {"msg": f"preparação: {exc}"}))
-            self.fila.put(("preparado", {}))
+            except BaseException as exc:  # noqa: BLE001
+                import traceback
+                print(traceback.format_exc(), flush=True)
+                self.fila.put(("erro", {"msg": f"preparação: {type(exc).__name__}: {exc} (detalhes em logs\\console.log)"}))
+            finally:
+                self.fila.put(("preparado", {}))
 
         threading.Thread(target=trabalho, daemon=True).start()
         self.root.after(120, self._bombear)
@@ -873,9 +880,12 @@ class Tela:
         def trabalho():
             try:
                 self.cfg["instalar"](itens, cb, self.cancelar, direto)
-            except Exception as exc:  # noqa: BLE001
-                self.fila.put(("erro", {"msg": str(exc)}))
-            self.fila.put(("terminou", {}))
+            except BaseException as exc:  # noqa: BLE001
+                import traceback
+                print(traceback.format_exc(), flush=True)
+                self.fila.put(("erro", {"msg": f"{type(exc).__name__}: {exc}"}))
+            finally:
+                self.fila.put(("terminou", {}))
 
         threading.Thread(target=trabalho, daemon=True).start()
         self.root.after(120, self._bombear)

@@ -613,3 +613,7 @@ Para MSI de verdade (não gerados pelo programa): `<nome>.mst` ao lado do MSI vi
 - Se o instalador mostra uma tela **de verdade ocupada** (CPU/disco ativos), ela é apenas ocultada, não encerrada.
 - Erros fatais da tela gráfica (sem console) aparecem numa caixa de mensagem e ficam em `logs\erro_fatal.txt`; a saída de texto vai para `logs\console.log`.
 - `INSTALAR.bat` continua abrindo um console por uma fração de segundo antes do UAC (limitação de qualquer `.bat`; para evitar, use um atalho com "Executar: Minimizado" ou um `.exe` lançador).
+
+## 🧯 Se a tela não abrir (v2.2.1)
+
+O `INICIAR.bat` agora testa se o Python consegue carregar o programa **antes** de abrir a tela. Se não conseguir, o erro aparece no prompt de comando e fica salvo em `logs\inicializacao.log` (envie esse arquivo para suporte). Se o Python não puder ser instalado com a barra de progresso (política de execução de scripts, por exemplo), o `.bat` tenta automaticamente o modo direto. Logs: `logs\python_instalacao.log` e `logs\python_instalacao_direto.log`.

@@ -32,6 +32,9 @@ if errorlevel 1 (
 )
 
 if not exist "%~dp0logs" mkdir "%~dp0logs" >nul 2>&1
+REM rastro de cada execucao: se a janela "abrir e fechar", logs\iniciar.log mostra ate onde chegou
+>>"%~dp0logs\iniciar.log" echo.
+>>"%~dp0logs\iniciar.log" echo [%date% %time%] inicio - argumentos: %*
 
 REM ---------------------------------------------------------------
 REM 1) Garante privilegios de administrador (a unica janela do Windows que ainda pode aparecer: o UAC)
@@ -68,16 +71,26 @@ if not defined PYINST (
 echo         Instalador: %PYINST%
 echo         Instalando o Python. NAO feche esta janela.
 echo.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0instalar_python.ps1" -Instalador "%PYINST%" -Log "%~dp0logs\python_instalacao.log"
+REM O script e carregado como TEXTO (ScriptBlock): assim a politica de execucao de .ps1 (GPO) nao o bloqueia
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create([IO.File]::ReadAllText('%~dp0instalar_python.ps1'))) -Instalador '%PYINST%' -Log '%~dp0logs\python_instalacao.log'"
 set "RC=!errorlevel!"
 echo.
 
 REM O PATH desta janela nao foi atualizado, entao procuramos o python.exe direto
 call :achar_python
+if defined PY goto :py_instalou
+
+echo         A instalacao com progresso nao concluiu, codigo !RC!. Tentando o modo direto.
+echo         Aguarde, isso pode levar alguns minutos. NAO feche esta janela.
+start "" /wait "%PYINST%" /quiet /norestart InstallAllUsers=1 PrependPath=1 Include_launcher=1 Include_tcltk=1 Include_test=0 Include_doc=0 /log "%~dp0logs\python_instalacao_direto.log"
+set "RC=!errorlevel!"
+call :achar_python
 if not defined PY (
     call :falha "O Python nao pode ser instalado ou localizado, codigo !RC!. Veja logs\python_instalacao.log."
     exit /b 1
 )
+
+:py_instalou
 echo         [OK] Python instalado com sucesso.
 goto :py_pronto
 
@@ -86,8 +99,10 @@ echo         [OK] Python ja instalado neste computador.
 
 :py_pronto
 set "PYVER="
-for /f "delims=" %%V in ('"%PY%" --version 2^>^&1') do set "PYVER=%%V"
+REM CORRECAO: "call" na frente evita que o cmd remova as aspas de caminhos com espaco (C:\Program Files\...)
+for /f "delims=" %%V in ('call "%PY%" --version 2^>^&1') do set "PYVER=%%V"
 if defined PYVER echo         %PYVER%
+>>"%~dp0logs\iniciar.log" echo [%date% %time%] python: %PY% - %PYVER%
 echo.
 
 REM ---------------------------------------------------------------
@@ -95,13 +110,27 @@ REM 3) Executa o instalador de MSIs
 REM ---------------------------------------------------------------
 :rodar
 echo   [3/3] Iniciando a conversao e a validacao dos pacotes
-echo         A tela do instalador vai abrir; esta janela fecha sozinha.
 set "PYTHONUTF8=1"
 set "PYEXE="
-for /f "delims=" %%P in ('"%PY%" -c "import sys;print(sys.executable)"') do set "PYEXE=%%P"
+for /f "delims=" %%P in ('call "%PY%" -c "import sys;print(sys.executable)"') do set "PYEXE=%%P"
 if not defined PYEXE set "PYEXE=%PY%"
 for %%I in ("%PYEXE%") do set "PYDIR=%%~dpI"
 set "PYW=%PYDIR%pythonw.exe"
+>>"%~dp0logs\iniciar.log" echo [%date% %time%] python.exe: %PYEXE% / pythonw.exe: %PYW%
+
+REM Auto-teste: se o Python nao conseguir CARREGAR o programa, o erro aparece aqui (com pythonw seria invisivel)
+"%PYEXE%" -c "import sys; sys.path.insert(0, r'%~dp0.'); import instalador_msi, tela_instalacao, validacao_msi" > "%~dp0logs\inicializacao.log" 2>&1
+if errorlevel 1 (
+    echo.
+    echo   [ERRO] O Python nao conseguiu carregar o instalador. Detalhes:
+    echo.
+    type "%~dp0logs\inicializacao.log"
+    echo.
+    echo   Esse texto tambem esta em logs\inicializacao.log - envie-o para suporte.
+    pause
+    exit /b 1
+)
+echo         A tela do instalador vai abrir; esta janela fecha sozinha.
 
 if defined GUI (
     REM tela grafica exige pythonw.exe + tkinter; sem eles cai no console (janela visivel)
@@ -110,6 +139,7 @@ if defined GUI (
     if defined GUI_OK ( "%PYEXE%" -c "import tkinter" >nul 2>&1 || set "GUI_OK=" )
     if defined GUI_OK (
         ping -n 4 127.0.0.1 >nul
+        >>"%~dp0logs\iniciar.log" echo [%date% %time%] abrindo a tela grafica
         start "" "!PYW!" "%~dp0instalador_msi.py" %*
         exit /b 0
     )

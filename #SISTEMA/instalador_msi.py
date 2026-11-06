@@ -18,7 +18,6 @@ import argparse
 import contextlib
 import ctypes
 import hashlib
-import mmap
 import os
 import re
 import shutil
@@ -383,13 +382,13 @@ _CB_BATIMENTO = None   # callable(seg, etapa) - usado pela tela gráfica para mo
 _CB_EVENTO = None      # callable(evento, **dados) - tela gráfica (instalação e preparação)
 
 
-def evento(tipo: str, /, **dados) -> None:
+def evento(*args, **dados) -> None:
     """Envia um evento para a tela gráfica (se houver). Nunca levanta exceção.
-    'tipo' é só-posicional: assim os dados podem ter uma chave chamada 'nome' (antes isso dava
-    TypeError e derrubava a conversão na tela gráfica)."""
-    if _CB_EVENTO:
+    O tipo do evento é o 1º argumento posicional; assim os dados podem ter uma chave chamada 'nome'
+    (antes isso dava TypeError e derrubava a conversão na tela gráfica)."""
+    if _CB_EVENTO and args:
         with contextlib.suppress(Exception):
-            _CB_EVENTO(tipo, **dados)
+            _CB_EVENTO(args[0], **dados)
 
 
 def aviso(msg: str, nivel: str = "info") -> None:
@@ -920,13 +919,35 @@ def listar_exe(pasta: Path) -> list[Path]:
 
 def detectar_instalador(exe: Path) -> Optional[tuple]:
     """Procura assinaturas de instaladores conhecidos. Devolve (tipo, args) ou None."""
+    # CORREÇÃO (tela "Não respondendo" / fechando): antes era mmap.find() no arquivo inteiro, uma
+    # varredura por assinatura. mmap.find SEGURA o GIL enquanto o Windows lê o arquivo do disco
+    # (pen drive/HD lento + antivírus), então a thread da tela gráfica ficava congelada por dezenas
+    # de segundos em .exe grandes; o Windows marcava a janela como "Não respondendo" e ela era
+    # encerrada. Agora: leitura em blocos (f.read libera o GIL), uma única passada, com sobreposição
+    # para não perder assinatura dividida entre dois blocos. A prioridade da lista é mantida.
+    bloco = 8 << 20
+    sobra = max(len(a) for a, _, _ in ASSINATURAS_EXE) - 1
+    achadas: set = set()
     try:
-        with open(exe, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-            for assinatura, tipo, args in ASSINATURAS_EXE:
-                if mm.find(assinatura) != -1:
-                    return tipo, args
+        with open(exe, "rb") as f:
+            anterior = b""
+            while True:
+                dados = f.read(bloco)
+                if not dados:
+                    break
+                janela = anterior + dados
+                for idx, (assinatura, _, _) in enumerate(ASSINATURAS_EXE):
+                    if idx not in achadas and assinatura in janela:
+                        achadas.add(idx)
+                if 0 in achadas:              # a de maior prioridade já apareceu: não precisa ler mais
+                    break
+                anterior = janela[-sobra:]
+                time.sleep(0)                 # devolve a vez para a tela gráfica
     except (OSError, ValueError):
-        pass
+        return None
+    if achadas:
+        _, tipo, args = ASSINATURAS_EXE[min(achadas)]
+        return tipo, args
     return None
 
 
@@ -1738,6 +1759,37 @@ def _garantir_streams() -> None:
     if sys.stderr is None:
         sys.stderr = f
     desativar_cores()
+    _ativar_diagnostico()
+
+
+_ARQ_FALHA = None
+
+
+def _ativar_diagnostico() -> None:
+    """Com pythonw, um travamento nativo (ctypes/msi.dll/Tk) ou um erro numa thread fechava a tela SEM
+    deixar rastro. Agora: falha nativa -> logs\\falha_nativa.txt; erro em thread -> logs\\erro_fatal.txt."""
+    global _ARQ_FALHA
+    with contextlib.suppress(Exception):
+        import faulthandler
+        LOG_DIR.mkdir(exist_ok=True)
+        _ARQ_FALHA = open(LOG_DIR / "falha_nativa.txt", "a", encoding="utf-8")
+        _ARQ_FALHA.write(f"\n=== início {datetime.now():%d/%m/%Y %H:%M:%S} | Python {sys.version.split()[0]} "
+                         f"| {sys.executable}\n")
+        _ARQ_FALHA.flush()
+        faulthandler.enable(file=_ARQ_FALHA, all_threads=True)
+
+    import threading
+
+    def _gancho_thread(a) -> None:
+        if a.exc_type is SystemExit:
+            return
+        texto = "".join(traceback.format_exception(a.exc_type, a.exc_value, a.exc_traceback))
+        with contextlib.suppress(Exception):
+            (LOG_DIR / "erro_fatal.txt").open("a", encoding="utf-8").write(
+                f"{datetime.now():%d/%m/%Y %H:%M:%S} [thread {getattr(a.thread, 'name', '?')}]\n{texto}\n")
+        with contextlib.suppress(Exception):
+            print(texto, flush=True)
+    threading.excepthook = _gancho_thread
 
 
 def _erro_fatal(exc: BaseException) -> None:
