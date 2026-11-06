@@ -1003,11 +1003,38 @@ def versao_exe(exe: Path) -> str:
 
 
 def _rodar(cmd: list, log: list) -> int:
-    r = ex.rodar_oculto(cmd, capture_output=True, text=True, errors="replace")
+    # candle/light são programas .NET de console. Com CREATE_NO_WINDOW (usado em rodar_oculto) eles
+    # nascem SEM console; aberto pela tela gráfica (pythonw, que também não tem console) o .NET falha
+    # ao configurar a saída e o candle sai com erro antes de compilar - em TODOS os pacotes.
+    # Aqui ganham um console próprio, porém OCULTO (SW_HIDE): nada aparece e o candle funciona.
+    kw: dict = {}
+    if os.name == "nt":
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0                                    # SW_HIDE
+        kw = {"creationflags": subprocess.CREATE_NEW_CONSOLE, "startupinfo": si}
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                           stdin=subprocess.DEVNULL, cwd=str(Path(cmd[0]).parent), **kw)
+    except OSError as exc:
+        log.append(f"> {cmd[0]}: NÃO EXECUTOU ({exc})")
+        return -1
     log.append("> " + " ".join(f'"{c}"' if " " in c else c for c in cmd))
     log.append(r.stdout or "")
     log.append(r.stderr or "")
+    log.append(f"(código de saída: {r.returncode} / 0x{r.returncode & 0xFFFFFFFF:08X})")
     return r.returncode
+
+
+def _motivo_wix(log: list) -> str:
+    """Primeira linha de erro do candle/light (para mostrar na tela, sem precisar abrir o log)."""
+    linhas = [l.strip() for bloco in log[-4:] for l in str(bloco).splitlines()
+              if l.strip() and (not l.startswith("> ") or "NÃO EXECUTOU" in l)]
+    for l in linhas:
+        if " error " in l.lower() or l.lower().startswith("error") or "erro" in l.lower() \
+                or "exception" in l.lower():
+            return l[:300]
+    return (linhas[-1] if linhas else "sem mensagem")[:300]
 
 
 def construir_msi(exe: Path, msi: Path, args: str, wix: tuple, log_path: Path) -> tuple:
@@ -1028,11 +1055,11 @@ def construir_msi(exe: Path, msi: Path, args: str, wix: tuple, log_path: Path) -
                 exe=quoteattr(str(exe.resolve())), args=quoteattr(args),
                 sha256=quoteattr(_sha256(exe)), bytes=quoteattr(str(exe.stat().st_size))), encoding="utf-8")
             if _rodar([str(candle), "-nologo", "-out", str(obj) + os.sep, str(wxs)], log) != 0:
-                return False, "candle falhou (veja o log)"
+                return False, f"candle falhou: {_motivo_wix(log)}"
             saida = tmp / "pkg.msi"
             if _rodar([str(light), "-nologo", "-sval", "-spdb", "-sw1079", "-out", str(saida),
                        str(obj / "pkg.wixobj")], log) != 0:
-                return False, "light falhou (veja o log)"
+                return False, f"light falhou: {_motivo_wix(log)}"
             if not saida.is_file():
                 return False, "MSI não foi gerado"
             shutil.move(str(saida), str(msi))
@@ -1743,6 +1770,7 @@ def ler_argumentos() -> argparse.Namespace:
                     help="diagnóstico: NÃO oculta nem encerra telas dos instaladores (só registra título/classe)")
     ap.add_argument("--lancador", action="store_true", help=argparse.SUPPRESS)  # uso interno do .bat
     ap.add_argument("--menu", action="store_true", help=argparse.SUPPRESS)      # uso interno do .bat
+    ap.add_argument("--elevado", action="store_true", help=argparse.SUPPRESS)   # uso interno do .bat
     ap.add_argument("--raiz", default=None,
                     help="pasta que contém as subpastas de MSI (padrão: pasta pai de #SISTEMA)")
     ap.add_argument("--sem-pausa", action="store_true",

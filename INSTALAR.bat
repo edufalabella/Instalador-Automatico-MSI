@@ -18,7 +18,7 @@ REM    INSTALAR.bat --ver-janelas        diagnostico: NAO oculta/encerra telas d
 REM ===============================================================
 setlocal
 
-echo %* | find /i "--status" >nul
+echo %* | "%SystemRoot%\System32\find.exe" /i "--status" >nul
 if not errorlevel 1 (
     call "%~dp0#SISTEMA\VER_STATUS.bat"
     exit /b 0
@@ -28,7 +28,7 @@ REM Padrao: INTERATIVO (converte/repara e depois mostra a tela para escolher o q
 REM Automatico (sem perguntas) somente com --auto, --sem-pausa, --pastas ou --listar.
 set "MODO="
 for %%A in (--auto --sem-pausa --pastas --listar) do (
-    echo %* | find /i "%%A" >nul
+    echo %* | "%SystemRoot%\System32\find.exe" /i "%%A" >nul
     if not errorlevel 1 set "MODO=--auto"
 )
 

@@ -2,7 +2,8 @@
 setlocal EnableDelayedExpansion
 chcp 65001 >nul
 title Iniciador - Instalador MSI
-cd /d "%~dp0"
+REM pushd (e nao "cd /d"): funciona tambem quando a pasta esta na rede (caminho \\servidor\...)
+pushd "%~dp0"
 
 REM --lancador  : (interno) indica que veio do INSTALAR.bat
 REM --auto      : instalacao sem menu/perguntas (console visivel)
@@ -11,17 +12,17 @@ REM Modo GRAFICO (padrao): a unica janela visivel e a tela Python; o console fic
 set "SEE_MASK_NOZONECHECKS=1"
 set "AUTO="
 set "NOPAUSE="
-echo %* | find /i "--auto" >nul && set "AUTO=1"
-echo %* | find /i "--sem-pausa" >nul && set "NOPAUSE=1"
+echo %* | "%SystemRoot%\System32\find.exe" /i "--auto" >nul && set "AUTO=1"
+echo %* | "%SystemRoot%\System32\find.exe" /i "--sem-pausa" >nul && set "NOPAUSE=1"
 set "GUI=1"
 for %%A in (--auto --console --listar --menu --sem-pausa --pastas) do (
-    echo %* | find /i "%%A" >nul && set "GUI="
+    echo %* | "%SystemRoot%\System32\find.exe" /i "%%A" >nul && set "GUI="
 )
 
 REM ---------------------------------------------------------------
 REM Protecao: este arquivo so roda quando chamado pelo INSTALAR.bat da raiz
 REM ---------------------------------------------------------------
-echo %* | find /i "--lancador" >nul
+echo %* | "%SystemRoot%\System32\find.exe" /i "--lancador" >nul
 if errorlevel 1 (
     echo.
     echo Este arquivo nao deve ser executado diretamente.
@@ -39,14 +40,46 @@ REM rastro de cada execucao: se a janela "abrir e fechar", logs\iniciar.log most
 REM ---------------------------------------------------------------
 REM 1) Garante privilegios de administrador (a unica janela do Windows que ainda pode aparecer: o UAC)
 REM ---------------------------------------------------------------
-net session >nul 2>&1
-if %errorlevel% neq 0 (
-    set "ESTILO=Normal"
-    REM o prompt de comando fica VISIVEL: ele mostra a instalacao do Python
-    powershell -NoProfile -WindowStyle Hidden -Command "try { Start-Process -FilePath '%~f0' -ArgumentList '%*' -Verb RunAs -WindowStyle !ESTILO! -ErrorAction Stop } catch { exit 1 }"
-    if errorlevel 1 call :falha "A permissao de administrador foi negada. O instalador precisa dela para funcionar."
-    exit /b
+REM CORRECAO: "net session" depende do servico "Servidor" (LanmanServer). Se ele estiver
+REM desativado (comum em PC corporativo), o teste falha MESMO como administrador: a janela
+REM elevada achava que nao era admin, pedia elevacao de novo e fechava - em loop.
+REM "fltmc" so funciona como administrador e nao depende de servico nenhum.
+"%SystemRoot%\System32\fltmc.exe" >nul 2>&1
+if %errorlevel% equ 0 goto :admin_ok
+echo %* | "%SystemRoot%\System32\find.exe" /i "--elevado" >nul
+if not errorlevel 1 (
+    >>"%~dp0logs\iniciar.log" echo [%date% %time%] ERRO: janela elevada sem privilegio de administrador
+    echo.
+    echo   [ERRO] A janela foi aberta como administrador, mas o Windows nao concedeu o privilegio.
+    echo          Clique com o botao direito no INSTALAR.bat e use "Executar como administrador".
+    echo.
+    pause
+    exit /b 1
 )
+
+REM Antes de elevar: anota o Python DESTE usuario. A janela elevada pode rodar com OUTRA conta
+REM (ex.: usuario comum + senha do TI) que nao enxerga o Python instalado so para este usuario.
+call :achar_python
+if defined PY (
+    for /f "delims=" %%P in ('call "%PY%" -c "import sys;print(sys.executable)" 2^>nul') do set "PYUSR=%%P"
+)
+if defined PYUSR >"%~dp0logs\python_usuario.txt" echo !PYUSR!
+>>"%~dp0logs\iniciar.log" echo [%date% %time%] sem admin; python deste usuario: "!PYUSR!" - pedindo elevacao
+
+REM CORRECAO do "abre e fecha": a janela elevada agora e um cmd que PAUSA se o .bat nao rodar ate o fim
+REM (pasta inacessivel para a conta de administrador, unidade de rede mapeada, erro de sintaxe...).
+REM Unidade mapeada (ex.: D: = \\servidor\pasta) nao existe na sessao elevada: trocamos pelo caminho de rede.
+set "IM_BAT=%~f0"
+set "IM_ARGS=%* --elevado"
+powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "$b = $env:IM_BAT; $l = $b.Substring(0,1); $d = Get-PSDrive -Name $l -ErrorAction SilentlyContinue; if ($d -and $d.DisplayRoot) { $b = $d.DisplayRoot.TrimEnd([char]92) + $b.Substring(2) }; $q = [string][char]34; $c = '/c call ' + $q + $b + $q + ' ' + $env:IM_ARGS + ' || (echo. & echo [ERRO] O instalador parou. Veja a mensagem acima. & pause)'; try { Start-Process -FilePath $env:ComSpec -ArgumentList $c -Verb RunAs -WindowStyle Normal -ErrorAction Stop } catch { exit 1 }"
+if errorlevel 1 (
+    >>"%~dp0logs\iniciar.log" echo [%date% %time%] elevacao negada ou falhou
+    call :falha "A permissao de administrador foi negada. O instalador precisa dela para funcionar."
+)
+exit /b
+
+:admin_ok
+>>"%~dp0logs\iniciar.log" echo [%date% %time%] rodando como administrador em "%CD%"
 
 REM Remove a marca de "arquivo baixado da internet" (evita avisos de seguranca e bloqueio das DLLs do WiX)
 powershell -NoProfile -WindowStyle Hidden -Command "Get-ChildItem -LiteralPath '%~dp0' -Recurse -File -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue" >nul 2>&1
@@ -158,7 +191,7 @@ set "IM_ARGS=%*"
 set "IM_FLAG=%~dp0logs\tela_aberta.flag"
 del /q "%IM_FLAG%" >nul 2>&1
 >>"%~dp0logs\iniciar.log" echo [%date% %time%] abrindo a tela grafica: %PYW%
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$a = [char]34 + $env:IM_SCRIPT + [char]34 + ' ' + $env:IM_ARGS; try { $p = Start-Process -FilePath $env:IM_PYW -ArgumentList $a -PassThru -ErrorAction Stop } catch { Write-Host $_.Exception.Message; exit 4 }; for ($i = 0; $i -lt 90; $i++) { if (Test-Path -LiteralPath $env:IM_FLAG) { exit 0 }; if ($p.HasExited) { exit 2 }; Start-Sleep -Milliseconds 500 }; exit 3"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$q = [string][char]34; $a = $q + $env:IM_SCRIPT + $q + ' ' + $env:IM_ARGS; try { $p = Start-Process -FilePath $env:IM_PYW -ArgumentList $a -PassThru -ErrorAction Stop } catch { Write-Host $_.Exception.Message; exit 4 }; for ($i = 0; $i -lt 90; $i++) { if (Test-Path -LiteralPath $env:IM_FLAG) { exit 0 }; if ($p.HasExited) { exit 2 }; Start-Sleep -Milliseconds 500 }; exit 3"
 set "GUIRC=%errorlevel%"
 >>"%~dp0logs\iniciar.log" echo [%date% %time%] resultado da abertura: %GUIRC% (0=abriu 2=morreu 3=sem janela 4=nao iniciou)
 if "%GUIRC%"=="0" exit /b 0
@@ -264,5 +297,12 @@ if %errorlevel% equ 0 (
 REM c) Pastas padrao de instalacao
 for /d %%D in ("%ProgramFiles%\Python3*" "%LocalAppData%\Programs\Python\Python3*") do (
     if exist "%%~D\python.exe" set "PY=%%~D\python.exe"
+)
+if defined PY exit /b 0
+
+REM d) Python anotado pela janela NAO elevada (instalacao "so para este usuario")
+if exist "%~dp0logs\python_usuario.txt" (
+    set /p "PYTMP=" <"%~dp0logs\python_usuario.txt"
+    if exist "!PYTMP!" set "PY=!PYTMP!"
 )
 exit /b 0
