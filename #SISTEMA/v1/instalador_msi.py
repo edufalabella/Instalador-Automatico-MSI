@@ -40,6 +40,8 @@ from typing import Optional
 import exec_silencioso as ex   # execução oculta, árvore de processos, watchdog (mesma pasta)
 import validacao_msi as val    # validação rigorosa dos pacotes MSI/EXE (mesma pasta)
 import analise_exe as ae       # instalador x portátil x menu, tipo e argumento silencioso (mesma pasta)
+import softwares_instalados as si   # lista de softwares instalados (registro) - botão 'Relistar'
+import unicodedata
 
 # ----------------------------------------------------------------------------
 # Configurações
@@ -55,7 +57,8 @@ ANIMACAO = True                 # False = pula as animações da tela inicial
 AUTO = False                    # True = modo automático (sem menu/ENTER/confirmação)
 GUI_ATIVA = False               # True enquanto a tela gráfica está aberta (saída de console linear)
 MODO_DIRETO = True              # MSI gerado por este programa: roda o .exe embutido FORA do msiexec
-TIMEOUT_EXE_MIN = 120           # tempo máximo (min) para cada instalador embutido
+TIMEOUT_EXE_MIN = 30            # tempo máximo (min) de um .exe SILENCIOSO (travou = segue para o próximo)
+TIMEOUT_INTERATIVO_MIN = 120    # tempo máximo (min) com a janela aberta para cliques (ex.: launcher do Mastercam)
 FABRICANTE_WRAPPER = "Instalador Automatico"   # marca dos MSI gerados por este programa
 TENTATIVAS_1618 = 5             # re-tentativas quando há outra instalação em andamento
 ESPERA_1618 = 30                # segundos entre as tentativas
@@ -63,9 +66,9 @@ ESPERA_1618 = 30                # segundos entre as tentativas
 # --- blindagem contra telas (v2.1) ---
 OCULTAR_JANELAS = True          # qualquer janela criada por um instalador é ocultada na hora
 VIGIAR_UI = True                # janela + instalador parado (esperando clique) => encerra e tenta o próximo argumento
-UI_OCIOSO_S = 60                # segundos de "tela aberta e sem atividade" para considerar travado
-MAX_TENTATIVAS_ARGS = 5         # quantos conjuntos de argumentos silenciosos tentar por instalador
-POS_OCIOSO_S = 45               # após o processo principal sair: espera filhos até ficarem ociosos
+UI_OCIOSO_S = 20                # segundos de "tela aberta e sem atividade" para considerar travado
+MAX_TENTATIVAS_ARGS = 3         # quantos conjuntos de argumentos silenciosos tentar por instalador
+POS_OCIOSO_S = 15               # após o processo principal sair: espera filhos até ficarem ociosos
 POS_MAX_S = 600                 # teto de espera pelos processos filhos
 ESPERA_MSI_LIVRE_S = 900        # espera máxima pelo Windows Installer ficar livre entre pacotes
 
@@ -87,8 +90,9 @@ LANCADORES_MIDIA = ("setup.exe", "install.exe", "installer.exe", "start.exe")   
 PORTATEIS_ACAO = "copiar"       # programa PORTÁTIL: "copiar" = copia para PASTA_PORTATEIS + atalho na Área de
                                 # Trabalho pública e no Menu Iniciar | "ignorar" = não faz nada
 PASTA_PORTATEIS = r"C:\Portateis"
+PORTATEIS_PARALELOS = max(2, min(4, os.cpu_count() or 2))   # portáteis copiados em paralelo COM as instalações
 LIMITE_COPIA_PORTATIL_MB = 1024 # pasta do portátil maior que isso: copia só o .exe
-PARADO_S = 180                  # .exe aberto SEM janela e SEM atividade por este tempo => encerrado
+PARADO_S = 45                   # .exe aberto SEM janela e SEM atividade por este tempo => encerrado
 PULAR_EXE_COM_CAB = True        # pasta com .cab = .exe é bootstrapper de um .msi: só o .msi aparece
 FALLBACK_INTERATIVO = True      # tela gráfica/menu: se o silencioso falhar, abre o instalador para clicar
                                 # (no modo --auto fica desligado: não há ninguém para clicar)
@@ -308,6 +312,109 @@ def tela_apresentacao() -> None:
 # ----------------------------------------------------------------------------
 # Descoberta de diretórios e MSIs
 # ----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+# Regras especiais: programas que só precisam ser COPIADOS (pasta inteira) + atalho na Área de Trabalho
+# ----------------------------------------------------------------------------
+def _nn(t: str) -> str:
+    """minúsculas, sem acentos, '/' como separador."""
+    return unicodedata.normalize("NFKD", str(t)).encode("ascii", "ignore").decode().lower().replace("\\", "/")
+
+
+# (regex no caminho do .exe, regex do nome da pasta-raiz a copiar [a mais próxima do .exe],
+#  regex do .exe principal [None = o maior .exe], nome do atalho)
+REGRAS_PORTATEIS = [
+    (r"/cade_simuv?[^/]*", r"^cade_simuv?\s*4", r"^cade_simu\.exe$", "CADe_SIMU 4.0"),
+    (r"/fluidsim[^/]*hidr", r"^fluidsim", r"^fsh.*\.exe$", "FluidSim Hidráulica 3.6"),
+    (r"/fluidsim[^/]*pneum", r"^fluidsim", r"^fsp.*\.exe$", "FluidSim Pneumática 3.5"),
+    (r"/pc_simu", r"^pc_simu$", r"^pc_simu\.exe$", "PC_SIMU"),
+    (r"/visualg", r"^visualg", r"^visualg.*\.exe$", "VisuAlg 3.0.7"),
+]
+_CACHE_REGRA: dict = {}
+
+
+def _principal_da_raiz(raiz: Path, rx_principal) -> Optional[Path]:
+    candidatos = []
+    for r, _d, arqs in os.walk(raiz):
+        for a in arqs:
+            if a.lower().endswith(".exe") and not a.lower().startswith(EXE_IGNORAR_PREFIXOS):
+                candidatos.append(Path(r) / a)
+    if not candidatos:
+        return None
+    pref = [c for c in candidatos if rx_principal and re.search(rx_principal, _nn(c.name))] or \
+           [c for c in candidatos if "/bin/" in _nn(c.parent) + "/"] or candidatos
+
+    def chave(c: Path):
+        try:
+            return (len(c.relative_to(raiz).parts), -c.stat().st_size)
+        except OSError:
+            return (99, 0)
+    return sorted(pref, key=chave)[0]
+
+
+def info_portatil_regra(exe: Path) -> Optional[dict]:
+    """Se o .exe pertence a um programa que só deve ser copiado+atalho: {raiz, principal, nome}."""
+    if exe in _CACHE_REGRA:
+        return _CACHE_REGRA[exe]
+    res = None
+    caminho = _nn(exe)
+    for rx_cam, rx_raiz, rx_princ, nome in REGRAS_PORTATEIS:
+        if not re.search(rx_cam, caminho):
+            continue
+        raiz = next((a for a in exe.parents if re.search(rx_raiz, _nn(a.name))), None)
+        if raiz is None or (BASE.exists() and raiz.resolve() == BASE.resolve()):
+            continue
+        princ = _principal_da_raiz(raiz, rx_princ)
+        if princ is not None:
+            res = {"raiz": raiz, "principal": princ, "nome": nome}
+            break
+    _CACHE_REGRA[exe] = res
+    return res
+
+
+def eh_launcher_midia(exe: Path) -> bool:
+    """launcher.exe de mídia com Autorun.inf (ex.: Mastercam): É o instalador e precisa rodar na pasta dele."""
+    if exe.name.lower() != "launcher.exe":
+        return False
+    with contextlib.suppress(OSError):
+        return any(f.name.lower() == "autorun.inf" for f in exe.parent.iterdir())
+    return False
+
+
+def _copiar_paralelo(origem: Path, destino: Path) -> int:
+    """Copia a pasta usando TODOS os núcleos (um arquivo por thread); pula o que já está igual."""
+    arqs = []
+    for r, ds, fs in os.walk(origem):
+        rel = Path(r).relative_to(origem)
+        (destino / rel).mkdir(parents=True, exist_ok=True)
+        arqs += [(Path(r) / f, destino / rel / f) for f in fs]
+
+    def um(par):
+        a, b = par
+        with contextlib.suppress(OSError):
+            sa, sb = a.stat(), b.stat()
+            if sa.st_size == sb.st_size and int(sa.st_mtime) <= int(sb.st_mtime) + 2:
+                return 0
+        shutil.copy2(a, b)
+        return 1
+    with ThreadPoolExecutor(max_workers=TRABALHADORES) as pool:
+        return sum(pool.map(um, arqs))
+
+
+def _nome_seguro(t: str) -> str:
+    return re.sub(r'[<>:"/\\|?*]', "_", t).strip() or "programa"
+
+
+def _atalhos_portatil(alvo: Path, destino: Path, nome: str, descricao: str) -> list:
+    publico = Path(os.environ.get("PUBLIC", r"C:\Users\Public"))
+    menu = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / r"Microsoft\Windows\Start Menu\Programs\Portáteis"
+    nome = _nome_seguro(nome)
+    lnks = (publico / "Desktop" / f"{nome}.lnk", menu / f"{nome}.lnk")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        ok = list(pool.map(lambda l: _criar_atalho(l, alvo, destino, descricao), lnks))
+    return [str(l) for l, o in zip(lnks, ok) if o]
+
+
 def listar_msi(pasta: Path) -> list[Path]:
     padrao = pasta.rglob("*") if BUSCA_RECURSIVA else pasta.glob("*")
     return sorted(
@@ -357,6 +464,8 @@ def listar_pacotes(pasta: Path) -> list[Path]:
             continue
         por_nome = {a.lower(): a for a in arqs}
         lancador = next((por_nome[l] for l in LANCADORES_MIDIA if l in por_nome), None)
+        if lancador is None and "autorun.inf" in por_nome and "launcher.exe" in por_nome:
+            lancador = por_nome["launcher.exe"]        # mídia com Autorun (Mastercam): o launcher é o instalador
         if ESCONDER_COMPONENTES and r != pasta and lancador and INSTALAR_EXE:
             exes.append(r / lancador)
             escondidos += sum(1 for a in arqs if a.lower().endswith((".exe", ".msi"))) - 1
@@ -374,6 +483,19 @@ def listar_pacotes(pasta: Path) -> list[Path]:
     # ferramentas de linha de comando portáteis (7za.exe, ffmpeg.exe...) e desinstaladores não aparecem:
     # não são programas para o usuário abrir nem instaladores. (.args explícito sempre aparece)
     if exes:
+        vistos_raiz: set = set()
+        novos = []
+        for e in exes:                       # CADe_SIMU, FluidSim, PC_SIMU, VisuAlg: UM item por programa
+            r = info_portatil_regra(e)
+            if r is None:
+                novos.append(e)
+            elif r["raiz"] not in vistos_raiz:
+                vistos_raiz.add(r["raiz"])
+                novos.append(r["principal"])
+            else:
+                escondidos += 1
+        exes = novos
+    if exes:
         def _an(e: Path):
             try:
                 return analise(e)
@@ -383,7 +505,7 @@ def listar_pacotes(pasta: Path) -> list[Path]:
             ans = list(pool.map(_an, exes))
         manter = []
         for e, a in zip(exes, ans):
-            if a and not _ler_linhas_args(_arquivo_args(e)) and \
+            if a and not _ler_linhas_args(_arquivo_args(e)) and info_portatil_regra(e) is None and \
                     (a.categoria == "desinstalador" or (a.categoria == "portatil" and not a.gui)):
                 escondidos += 1
                 continue
@@ -918,7 +1040,7 @@ def _rodar_exe(exe: Path, cwd: Path, candidatos: list, log_file: Path, anotar, i
 
         def rodar() -> int:
             res = ex.executar_arvore(
-                linha_cmd, str(cwd), TIMEOUT_EXE_MIN * 60, tick=tick,
+                linha_cmd, str(cwd), (TIMEOUT_INTERATIVO_MIN if visivel else TIMEOUT_EXE_MIN) * 60, tick=tick,
                 ocultar=OCULTAR_JANELAS, vigiar_ui=VIGIAR_UI, ui_ocioso_s=UI_OCIOSO_S,
                 pos_ocioso_s=POS_OCIOSO_S, pos_max_s=POS_MAX_S, visivel=visivel, parado_s=PARADO_S,
                 ao_janela=lambda d: (anotar(f"Janela detectada e ocultada: {d}"),
@@ -1002,6 +1124,9 @@ def instalar_exe(exe: Path, log_file: Path, interativo: bool = False) -> int:
             tipo = a.tipo if a.categoria == "instalador" else ""
             anotar(f"Análise: {a.rotulo} | tipo: {a.tipo or 'desconhecido'} | {a.motivo}"
                    f"{' | ' + a.descricao if a.descricao else ''}")
+        if eh_launcher_midia(exe):
+            anotar("launcher de mídia (Autorun.inf): é o instalador; abre NORMAL, com a pasta dele como diretório de trabalho")
+            return _rodar_exe(exe, exe.parent, [INTERATIVO], log_file, anotar, True, "")
         candidatos = candidatos_args(exe, exe)
         anotar("Tentativas de argumentos: " + " || ".join(candidatos))
         return _rodar_exe(exe, exe.parent, candidatos, log_file, anotar, interativo, tipo)
@@ -1051,30 +1176,34 @@ def instalar_portatil(exe: Path, log_file: Path) -> int:
         anotacoes.append(f"[{datetime.now():%H:%M:%S}] {txt}")
 
     try:
-        a = analise(exe)
-        anotar(f"Programa PORTÁTIL | {exe} | {a.motivo}")
-        categorias = {p.resolve() for p in pastas_validas()} if BASE.exists() else set()
-        origem = exe.parent
-        sozinho = origem.resolve() in categorias or \
-            _tamanho_pasta(origem, LIMITE_COPIA_PORTATIL_MB << 20) > (LIMITE_COPIA_PORTATIL_MB << 20)
-        nome_pasta = exe.stem if sozinho else origem.name
-        destino = Path(PASTA_PORTATEIS) / re.sub(r'[<>:"/\\|?*]', "_", nome_pasta)
+        regra = info_portatil_regra(exe)
+        if regra:
+            a = None
+            anotar(f"Programa PORTÁTIL (regra especial: {regra['nome']}) | pasta {regra['raiz']}")
+            origem, nome_pasta, sozinho = regra["raiz"], regra["nome"], False
+            exe = regra["principal"]
+        else:
+            a = analise(exe)
+            anotar(f"Programa PORTÁTIL | {exe} | {a.motivo}")
+            categorias = {p.resolve() for p in pastas_validas()} if BASE.exists() else set()
+            origem = exe.parent
+            sozinho = origem.resolve() in categorias or \
+                _tamanho_pasta(origem, LIMITE_COPIA_PORTATIL_MB << 20) > (LIMITE_COPIA_PORTATIL_MB << 20)
+            nome_pasta = exe.stem if sozinho else origem.name
+        destino = Path(PASTA_PORTATEIS) / _nome_seguro(nome_pasta)
         destino.mkdir(parents=True, exist_ok=True)
         ESTADO["acao"] = "copiando o programa portátil"
-        gravar_status()
         if sozinho:
             shutil.copy2(exe, destino / exe.name)
             anotar(f"Copiado só o .exe para {destino}")
+            alvo = destino / exe.name
         else:
-            shutil.copytree(origem, destino, dirs_exist_ok=True)
-            anotar(f"Copiada a pasta {origem} para {destino}")
-        alvo = destino / exe.name
-        nome = (a.descricao if a.descricao and len(a.descricao) <= 60 else exe.stem).strip()
-        nome = re.sub(r'[<>:"/\\|?*]', "_", nome) or exe.stem
-        publico = Path(os.environ.get("PUBLIC", r"C:\Users\Public"))
-        menu = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / r"Microsoft\Windows\Start Menu\Programs\Portáteis"
-        criados = [str(l) for l in (publico / "Desktop" / f"{nome}.lnk", menu / f"{nome}.lnk")
-                   if _criar_atalho(l, alvo, destino, a.descricao or exe.stem)]
+            n = _copiar_paralelo(origem, destino)
+            anotar(f"Copiada a pasta {origem} para {destino} ({n} arquivo(s) novos/alterados)")
+            alvo = destino / exe.relative_to(origem)
+        desc = (a.descricao if a is not None and a.descricao else exe.stem)
+        nome = nome_pasta if regra else ((desc if len(desc) <= 60 else exe.stem).strip() or exe.stem)
+        criados = _atalhos_portatil(alvo, destino, nome, desc)
         anotar("Atalhos: " + (", ".join(criados) or "nenhum (não foi possível criar)"))
         aviso(f"portátil copiado para {destino}" + (" + atalho na Área de Trabalho" if criados else ""), "info")
         return 0
@@ -1163,6 +1292,26 @@ def instalar_lista(itens: list[tuple[Path, list[Path]]], callback=None, cancelar
         emit("inicio", total=total)
         cancelado = False
 
+        def _registrar(i, pasta, msi, modo, codigo, bloqueio, dur):
+            """Grava o resultado de um pacote (tela, log, resumo)."""
+            ok = codigo in CODIGOS_OK
+            status = (f"BLOQUEADO pela validação ({bloqueio})" if bloqueio
+                      else CODIGOS_OK.get(codigo) or texto_falha(codigo, ESTADO.get("tipo", "")))
+            if modo == "portátil" and ok:
+                status = f"Portátil copiado para {PASTA_PORTATEIS}" if PORTATEIS_ACAO == "copiar" else "Portátil (ignorado)"
+            elif not ok and ESTADO.get("diag"):
+                status += f" - {ESTADO['diag']}"
+            cor, marca = (VERDE, " OK ") if ok else (VERMELHO, "ERRO")
+            print(f"        {ts()}{cor}[{marca}] {status}{RESET} {CINZA}({dur}s){RESET}\n")
+            resultados.append((f"{pasta.name}\\{msi.name}", codigo, status))
+            modos.append(modo)
+            gravar_status()
+            emit("resultado", i=i, total=total, pasta=pasta, msi=msi, codigo=codigo,
+                 status=status, dur=dur, ok=ok)
+
+        pendentes: list = []          # portáteis copiados EM PARALELO enquanto os instaladores rodam
+        pool_port = ThreadPoolExecutor(max_workers=PORTATEIS_PARALELOS)
+
         for i, (pasta, msi) in enumerate(todos, start=1):
             if cancelar is not None and cancelar.is_set():
                 cancelado = True
@@ -1180,6 +1329,10 @@ def instalar_lista(itens: list[tuple[Path, list[Path]]], callback=None, cancelar
             if exe and not bloqueio:
                 with contextlib.suppress(Exception):
                     categoria = analise(msi).categoria
+                if info_portatil_regra(msi):
+                    categoria = "portatil"            # CADe_SIMU/FluidSim/PC_SIMU/VisuAlg: só copiar + atalho
+                elif eh_launcher_midia(msi):
+                    categoria = "instalador"          # launcher do Mastercam: roda NA pasta dele
                 if _ler_linhas_args(_arquivo_args(msi)):
                     categoria = "instalador"          # .args explícito: o técnico manda
             embutido = not exe and direto and not bloqueio and pacote_embutido(msi)
@@ -1193,6 +1346,9 @@ def instalar_lista(itens: list[tuple[Path, list[Path]]], callback=None, cancelar
             gravar_status()
             emit("item", i=i, total=total, pasta=pasta, msi=msi, modo=modo)
             t0 = time.time()
+            if modo == "portátil" and not bloqueio and PORTATEIS_ACAO == "copiar":
+                pendentes.append((i, pasta, msi, modo, t0, pool_port.submit(instalar_portatil, msi, log_file)))
+                continue                      # não espera: o próximo instalador já começa
             if bloqueio:
                 codigo = CODIGO_BLOQUEADO
                 aviso(f"BLOQUEADO pela validação: {bloqueio}", "erro")
@@ -1214,21 +1370,16 @@ def instalar_lista(itens: list[tuple[Path, list[Path]]], callback=None, cancelar
                     codigo = instalar_embutido(msi, log_file, interativo)
                 else:
                     codigo = instalar_msi(msi, log_file)
-            dur = int(time.time() - t0)
-            ok = codigo in CODIGOS_OK
-            status = (f"BLOQUEADO pela validação ({bloqueio})" if bloqueio
-                      else CODIGOS_OK.get(codigo) or texto_falha(codigo, ESTADO.get("tipo", "")))
-            if modo == "portátil" and ok:
-                status = f"Portátil copiado para {PASTA_PORTATEIS}" if PORTATEIS_ACAO == "copiar" else "Portátil (ignorado)"
-            elif not ok and ESTADO.get("diag"):
-                status += f" - {ESTADO['diag']}"
-            cor, marca = (VERDE, " OK ") if ok else (VERMELHO, "ERRO")
-            print(f"        {ts()}{cor}[{marca}] {status}{RESET} {CINZA}({dur}s){RESET}\n")
-            resultados.append((f"{pasta.name}\\{msi.name}", codigo, status))
-            modos.append(modo)
-            gravar_status()
-            emit("resultado", i=i, total=total, pasta=pasta, msi=msi, codigo=codigo,
-                 status=status, dur=dur, ok=ok)
+            _registrar(i, pasta, msi, modo, codigo, bloqueio, int(time.time() - t0))
+
+        for (i, pasta, msi, modo, t0, fut) in pendentes:     # portáteis (quase sempre já terminaram)
+            try:
+                codigo = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                aviso(f"portátil {msi.name}: {exc}", "erro")
+                codigo = 1
+            _registrar(i, pasta, msi, modo, codigo, "", int(time.time() - t0))
+        pool_port.shutdown(wait=True)
 
         print(f"  {barra(len(resultados), total)}\n")
 
@@ -1735,6 +1886,29 @@ def _marcar_tela_aberta() -> None:
     print(f"  {datetime.now():%H:%M:%S} Tela gráfica aberta.", flush=True)
 
 
+_INSTALADOS: dict = {"lista": None}
+_TRAVA_INST = threading.Lock()
+
+
+def listar_instalados(forcar: bool = False) -> list:
+    """Lê (e guarda) a lista de programas instalados; forcar=True = botão 'Relistar'."""
+    with _TRAVA_INST:
+        if forcar or _INSTALADOS["lista"] is None:
+            _INSTALADOS["lista"] = si.listar(incluir_store=forcar)
+        return list(_INSTALADOS["lista"])
+
+
+def pacote_ja_instalado(pac: Path) -> str:
+    """Nome do programa já instalado (ou pasta portátil já copiada) que corresponde ao pacote; '' se não."""
+    try:
+        regra = info_portatil_regra(pac) if eh_exe(pac) else None
+        if regra:
+            return regra["nome"] if (Path(PASTA_PORTATEIS) / _nome_seguro(regra["nome"])).exists() else ""
+        return si.ja_instalado(pac.name if pac.suffix.lower() != ".msi" else pac.stem, listar_instalados())
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def abrir_interface(preparar=None) -> bool:
     """Abre a tela gráfica. 'preparar(callback)' (opcional) roda ANTES da seleção, dentro da própria tela
     (validação dos pacotes), para o técnico ver só ela. False = não foi possível abrir."""
@@ -1763,6 +1937,8 @@ def abrir_interface(preparar=None) -> bool:
             "preparar": preparar, "status_validacao": status_validacao,
             "preselecionar": PRESELECIONAR_VALIDOS and VALIDAR,
             "ao_abrir": _marcar_tela_aberta,
+            "listar_instalados": listar_instalados, "ja_instalado": pacote_ja_instalado,
+            "exportar_instalados": lambda itens, arq: si.exportar(itens, arq), "pasta_logs": str(LOG_DIR),
         })
     except Exception as exc:  # noqa: BLE001
         GUI_ATIVA = False
@@ -1861,24 +2037,70 @@ def ler_argumentos() -> argparse.Namespace:
     return ap.parse_args()
 
 
+class _SaidaSegura:
+    """stdout/stderr que NUNCA levantam erro. Com pythonw (e principalmente elevado pelo launcher) os
+    handles herdados ficam inválidos: sys.stdout existe, mas print() dá PermissionError [Errno 13] e
+    derrubava a tela ao fechar. Se a escrita falhar, passa a gravar em logs\\console.log."""
+
+    encoding = "utf-8"
+    errors = "replace"
+
+    def __init__(self, destino):
+        self._f = destino
+
+    def _reabrir(self) -> bool:
+        try:
+            LOG_DIR.mkdir(exist_ok=True)
+            self._f = open(LOG_DIR / "console.log", "a", encoding="utf-8", buffering=1)
+            return True
+        except Exception:  # noqa: BLE001
+            self._f = None
+            return False
+
+    def write(self, texto):
+        for _ in range(2):
+            if self._f is None and not self._reabrir():
+                break
+            try:
+                return self._f.write(texto)
+            except Exception:  # noqa: BLE001
+                self._f = None
+        return len(texto) if isinstance(texto, str) else 0
+
+    def flush(self):
+        with contextlib.suppress(Exception):
+            if self._f is not None:
+                self._f.flush()
+
+    def isatty(self):
+        return False
+
+    def writable(self):
+        return True
+
+    def fileno(self):
+        raise OSError("sem descritor")
+
+
 def _garantir_streams() -> None:
-    """Com pythonw.exe (sem console) sys.stdout/sys.stderr são None e qualquer print() derrubaria o
-    programa. Redireciona para logs\\console.log."""
+    """Sempre troca sys.stdout/sys.stderr por _SaidaSegura (inclusive com pythonw: handles None/inválidos)."""
     global SEM_CONSOLE
-    if sys.stdout is not None and sys.stderr is not None:
-        return
-    SEM_CONSOLE = True
-    try:
-        LOG_DIR.mkdir(exist_ok=True)
-        f = open(LOG_DIR / "console.log", "a", encoding="utf-8", buffering=1)
-    except OSError:
-        f = open(os.devnull, "w", encoding="utf-8")
-    if sys.stdout is None:
-        sys.stdout = f
-    if sys.stderr is None:
-        sys.stderr = f
-    desativar_cores()
-    _ativar_diagnostico()
+    sem = (sys.stdout is None or sys.stderr is None
+           or os.path.basename(sys.executable or "").lower().startswith("pythonw"))
+    if sem:
+        SEM_CONSOLE = True
+        try:
+            LOG_DIR.mkdir(exist_ok=True)
+            f = open(LOG_DIR / "console.log", "a", encoding="utf-8", buffering=1)
+        except OSError:
+            f = None
+        sys.stdout = _SaidaSegura(f)
+        sys.stderr = sys.stdout
+        desativar_cores()
+        _ativar_diagnostico()
+    else:
+        sys.stdout = _SaidaSegura(sys.stdout)
+        sys.stderr = _SaidaSegura(sys.stderr)
 
 
 _ARQ_FALHA = None
@@ -1917,7 +2139,8 @@ def _erro_fatal(exc: BaseException) -> None:
     with contextlib.suppress(Exception):
         LOG_DIR.mkdir(exist_ok=True)
         (LOG_DIR / "erro_fatal.txt").write_text(f"{datetime.now():%d/%m/%Y %H:%M:%S}\n{texto}", encoding="utf-8")
-    print(texto)
+    with contextlib.suppress(Exception):
+        print(texto)
     if SEM_CONSOLE:
         with contextlib.suppress(Exception):
             import tkinter

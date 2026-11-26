@@ -337,6 +337,9 @@ class Tela:
                  wraplength=px(215)).pack(side="left", padx=(px(10), 0))
         ligar(opt, "<Button-1>", self._alternar_interativo)
 
+        Botao(dir_, "Softwares instalados…", self._abrir_instalados, "sec", largura=250, altura=36,
+              bg=C["card"]).pack(anchor="w", padx=px(20), pady=(px(16), 0))
+
         self.aviso_adm = tk.Label(dir_, text="", bg=C["card"], fg=C["aviso"], font=self.F(9),
                                   wraplength=px(250), justify="left")
         self.aviso_adm.pack(anchor="w", padx=px(20), pady=(px(10), 0))
@@ -410,6 +413,7 @@ class Tela:
         self.sel = {}
         self.info = {}
         self.val, self.bloqueados = {}, set()
+        self.ja = {}
         pre = bool(self.cfg.get("preselecionar"))
         leitor = self.cfg.get("status_validacao")
         for pasta, msis in self.dirs:
@@ -429,6 +433,13 @@ class Tela:
                     self.info[m] = ("MSI", 0)
                 # MENU (autorun) só funciona com cliques: não vem marcado
                 pre_m = pre and self.info[m][0] != "MENU"
+                try:
+                    jai = self.cfg["ja_instalado"](m) if self.cfg.get("ja_instalado") else ""
+                except Exception:
+                    jai = ""
+                if jai:
+                    self.ja[m] = jai
+                    pre_m = False          # já está no computador: não vem marcado
                 self.sel[m] = False if m in self.bloqueados else antigos.get(m, pre_m)
         self._construir_lista()
 
@@ -515,6 +526,9 @@ class Tela:
         except ValueError:
             pass
         tag, tam = self.info.get(msi, ("MSI", 0))
+        if msi in getattr(self, "ja", {}):
+            tk.Label(linha, text=" JÁ INSTALADO ", bg="#123A31", fg="#6EE7B7", font=self.F(8, "bold")
+                     ).pack(side="right", padx=(0, px(4)))
         tk.Label(linha, text=fmt_tam(tam), bg=base, fg=C["suave"], font=self.F(9), width=9, anchor="e"
                  ).pack(side="right", padx=(0, px(16)))
         fg, bgc = {"PORTÁTIL": ("#FCD34D", "#3D3212"), "MENU": ("#F9A8D4", "#3F1D33")}.get(
@@ -696,9 +710,116 @@ class Tela:
                 "Sair agora pode deixá-la incompleta.\n\nDeseja sair mesmo assim?"):
             return
         self.cancelar.set()
-        print(f"  {datetime.now():%H:%M:%S} Tela fechada pelo usuário"
-              f"{' DURANTE uma operação (validação/instalação interrompida)' if self.rodando else ''}.", flush=True)
+        try:
+            print(f"  {datetime.now():%H:%M:%S} Tela fechada pelo usuário"
+                  f"{' DURANTE uma operação (validação/instalação interrompida)' if self.rodando else ''}.", flush=True)
+        except Exception:      # handle de saída inválido (pythonw elevado): nunca impede de fechar
+            pass
         self.root.destroy()
+
+    # ---------------------------------------------------- softwares instalados no computador
+    def _abrir_instalados(self):
+        if getattr(self, "_jan_inst", None) is not None and self._jan_inst.winfo_exists():
+            self._jan_inst.lift()
+            return
+        j = tk.Toplevel(self.root)
+        self._jan_inst = j
+        j.title("Softwares instalados neste computador")
+        j.configure(bg=C["bg"])
+        j.geometry(f"{px(880)}x{px(560)}")
+        j.transient(self.root)
+        topo = tk.Frame(j, bg=C["bg"])
+        topo.pack(fill="x", padx=px(16), pady=(px(14), px(6)))
+        busca = tk.StringVar()
+        ent = tk.Entry(topo, textvariable=busca, bg=C["card"], fg=C["texto"], insertbackground=C["texto"],
+                       relief="flat", font=self.F(11))
+        ent.pack(side="left", fill="x", expand=True, ipady=px(6), padx=(0, px(10)))
+        info = tk.Label(topo, text="", bg=C["bg"], fg=C["suave"], font=self.F(10))
+        info.pack(side="right", padx=(px(10), 0))
+        cols = ("nome", "versao", "fabricante", "origem")
+        st = ttk.Style(j)
+        with_ = st.theme_use()
+        st.configure("Inst.Treeview", background=C["linha"], fieldbackground=C["linha"], foreground=C["texto"],
+                     rowheight=px(24), borderwidth=0)
+        st.configure("Inst.Treeview.Heading", background=C["pasta"], foreground=C["texto"], relief="flat")
+        arv = ttk.Treeview(j, columns=cols, show="headings", style="Inst.Treeview")
+        for c, t, w in (("nome", "Programa", 430), ("versao", "Versão", 110), ("fabricante", "Fabricante", 220),
+                        ("origem", "Origem", 80)):
+            arv.heading(c, text=t)
+            arv.column(c, width=px(w), anchor="w")
+        sb = ttk.Scrollbar(j, orient="vertical", command=arv.yview)
+        arv.configure(yscrollcommand=sb.set)
+        rod = tk.Frame(j, bg=C["bg"])
+        rod.pack(side="bottom", fill="x", padx=px(16), pady=px(12))
+        sb.pack(side="right", fill="y", pady=(0, px(0)))
+        arv.pack(fill="both", expand=True, padx=(px(16), 0))
+        dados = {"itens": []}
+
+        def mostrar(*_):
+            q = busca.get().strip().lower()
+            arv.delete(*arv.get_children())
+            n = 0
+            for i in dados["itens"]:
+                if q and q not in f"{i['nome']} {i['fabricante']}".lower():
+                    continue
+                arv.insert("", "end", values=(i["nome"], i["versao"], i["fabricante"], i["origem"]))
+                n += 1
+            info.configure(text=f"{n} de {len(dados['itens'])} programa(s)")
+
+        fila = queue.Queue()
+
+        def carregar(forcar=True):
+            info.configure(text="Lendo o registro do Windows…")
+            b_rel.configurar(habilitado=False)
+
+            def trab():
+                try:
+                    fila.put(("ok", self.cfg["listar_instalados"](forcar)))
+                except Exception as exc:  # noqa: BLE001
+                    fila.put(("erro", str(exc)))
+            threading.Thread(target=trab, daemon=True).start()
+            j.after(100, esperar)
+
+        def esperar():
+            try:
+                tipo, val_ = fila.get_nowait()
+            except queue.Empty:
+                if j.winfo_exists():
+                    j.after(100, esperar)
+                return
+            if not j.winfo_exists():
+                return
+            b_rel.configurar(habilitado=True)
+            if tipo == "ok":
+                dados["itens"] = val_
+                mostrar()
+                # a lista mudou: reavalia o selo "JÁ INSTALADO" dos pacotes
+                with_sel = dict(self.sel)
+                self.recarregar()
+                self.sel.update({k: v for k, v in with_sel.items() if k in self.sel and k not in self.bloqueados})
+                self._atualizar_estados()
+            else:
+                info.configure(text=f"Erro: {val_}")
+
+        def exportar():
+            from tkinter import filedialog
+            arq = filedialog.asksaveasfilename(
+                parent=j, defaultextension=".csv", initialfile="softwares_instalados.csv",
+                filetypes=[("Planilha CSV", "*.csv"), ("Texto", "*.txt")])
+            if arq:
+                try:
+                    self.cfg["exportar_instalados"](dados["itens"], arq)
+                    messagebox.showinfo("Exportado", f"Lista salva em:\n{arq}", parent=j)
+                except Exception as exc:  # noqa: BLE001
+                    messagebox.showerror("Erro", str(exc), parent=j)
+
+        b_rel = Botao(rod, "Relistar", lambda: carregar(True), "pri", largura=140, altura=38)
+        b_rel.pack(side="left")
+        Botao(rod, "Exportar…", exportar, "sec", largura=140, altura=38).pack(side="left", padx=px(10))
+        Botao(rod, "Fechar", j.destroy, "sec", largura=120, altura=38).pack(side="right")
+        busca.trace_add("write", mostrar)
+        ent.focus_set()
+        carregar(False)
 
     def _cancelar(self):
         self.cancelar.set()

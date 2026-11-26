@@ -1,0 +1,8 @@
+Copie os 3 arquivos para E:\NTI - Softwares GSTI\#SISTEMA (substitui instalador_msi.py e tela_instalacao.py; softwares_instalados.py é novo).
+
+1. Erro fatal (PermissionError ao fechar a tela): stdout/stderr agora são "seguros" (se o handle for inválido, grava em logs\console.log).
+2. Mastercam: launcher.exe com Autorun.inf é tratado como INSTALADOR (abre normal, com a pasta dele como diretório de trabalho; só ele aparece na lista).
+3. Só copiar + atalho na Área de Trabalho: CADe_SIMU 4.0, FluidSim Hidráulica 3.6, FluidSim Pneumática 3.5, PC_SIMU, VisuAlg 3.0.7 (um item por programa; cópia em C:\Portateis).
+4. Rapidez: portáteis copiados em paralelo (todos os núcleos) enquanto os instaladores rodam; tempos de espera reduzidos (tela travada 60s->20s, sem atividade 180s->45s, 3 tentativas em vez de 5, timeout silencioso 30 min); nada trava a fila.
+5. Botão "Softwares instalados…" (painel direito): lista tudo do registro, busca, "Relistar" e exportar CSV/TXT.
+6. Pacotes já instalados ganham o selo JÁ INSTALADO e não vêm pré-marcados.
